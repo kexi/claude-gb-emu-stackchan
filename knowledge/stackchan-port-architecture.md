@@ -224,6 +224,8 @@ KANTANの自動演奏はフロントエンド側でコード進行を生成し�
 - 同じ修正をホスト側の波形でも確認した。KANTAN内蔵デモ3,500 frameを同期rendererとCoreS3相当（deferred producer + aligner + DC blocker + 0.9 gain）で16-bit monoへ書き出し、演奏中に前後が有音のまま5 msのRMSが無音へ落ちる区間は両者とも0件だった。整列版の最大隣接sample差は8,517で、その近傍はADPCMアタックの立ち上がりであり不連続なクリックではない。秒ごとのRMS比（整列版/同期版）は1.173〜1.282、平均1.207で、ADPCM mix gain 0.75による意図した増分と一致する。
 - 上記の実機計測は`GB_PROFILE`付きautoplayビルドで行った。過去の記録どおり命令単位cycle計測は約5 fpsの摂動を持つため、これらのfps値をそのまま製品性能として扱わない。非計測版autoplay firmware（静的RAM 267,596 B / 81.7%、Flash 656,013 B / 10.0%）を書き込み済みで、利用者の聴取確認は未完了である。
 - 実機ログ取得中、`just logs`が3回連続で0 byteになった。修正前HEADのfirmwareでも同じだったため変更起因ではない。`esptool --no-stub --after hard_reset`でMACを読んでリセットすると復旧したので、原因はfirmwareではなく直前の書き込み後にUSB-Serial/JTAGがdownload状態に留まったことである。0 byteログを見たらまずhard resetをかける。
+- 目標貯金14,336 samplesの版を600秒・35,991 frame連続で計測し、収束を確定した。`speaker_queue_empty`は起動直後の1回から最後まで増えず、`audio_underruns`、`audio_dropped`、`audio_output_clips`、`adpcm_fifo_rejected`、`alignment_failures`、`speaker_queue_failures`、`event_backpressure`はすべて0だった。ringは6,268〜15,258 samples、1秒窓の最小生成は39,296 samples、free heapは82,852 Bで全期間一定である。FM event queueのhigh-waterは最大995/2,047で、fill区間のburstにも余裕があった。300秒計測と同じ結論であり、時間を倍にしても劣化しない。
+- 修正をmainへpushしたGitHub Actions run `32751082104`は5分28秒で成功し、`nix flake check`と`nix develop --command just ci`がともに通過した。
 
 [^local-gb-core]: 現行 `core/` の 2026-08-24 時点のソース調査。
 [^nes-stackchan-port]: NES 移植例の `core/`、`m5stack/`、ホスト比較 harness、性能関連コミットの調査。
