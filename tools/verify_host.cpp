@@ -2,6 +2,7 @@
 // What it guarantees: event batching does not change CPU-visible state, memory,
 // rendered pixels, or generated audio for the same ROM and frame-boundary input.
 #include "../core/gb.h"
+#include "../m5stack/src/kantan_autoplay.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -74,6 +75,9 @@ bool verifyChromaticV4() {
     gb::ChromaticFM fm;
     fm.enabled = true;
     fm.reset();
+    // What it guarantees: the synchronous renderer does not reserve the
+    // producer-only event queue on the Core 0 audio worker stack.
+    if (fm.events != nullptr) return false;
     const bool identityMatches = fm.read(6) == 0x51 && fm.read(7) == 0x04;
     if (!identityMatches) return false;
 
@@ -92,7 +96,80 @@ bool verifyChromaticV4() {
 
     fm.write(3, 0x8D);
     for (int sample = 0; sample < 4; sample++) fm.generateSample(44100.0);
-    return (fm.read(2) & 0x20) == 0;
+    if ((fm.read(2) & 0x20) != 0) return false;
+
+    gb::ChromaticFM deferredFm;
+    deferredFm.enabled = true;
+    deferredFm.deferred = true;
+    deferredFm.reset();
+    // What it guarantees: the single-producer/single-consumer queue holds a
+    // full register burst without overwriting or reordering any YM write.
+    for (uint16_t index = 0; index < gb::ChromaticFM::EVENT_CAPACITY - 1; index++) {
+        deferredFm.write(0, static_cast<uint8_t>(index));
+        deferredFm.write(1, static_cast<uint8_t>(index ^ 0xA5));
+    }
+    if (deferredFm.events == nullptr || deferredFm.eventHighWater != gb::ChromaticFM::EVENT_CAPACITY - 1) {
+        return false;
+    }
+    for (uint16_t index = 0; index < gb::ChromaticFM::EVENT_CAPACITY - 1; index++) {
+        gb::ChromaticEvent event;
+        if (!deferredFm.popDeferredEvent(event)) return false;
+        const bool eventMatches = event.type == gb::ChromaticEventType::YmWrite &&
+                                  event.address == static_cast<uint8_t>(index) &&
+                                  event.value == static_cast<uint8_t>(index ^ 0xA5);
+        if (!eventMatches) return false;
+    }
+    gb::ChromaticEvent unexpectedEvent;
+    return !deferredFm.popDeferredEvent(unexpectedEvent);
+}
+
+bool verifyKantanDemoInput() {
+    uint32_t risingEdges = 0;
+    uint32_t pressedFrames = 0;
+    uint8_t previous = 0;
+    for (uint32_t frame = 0; frame < 1000; frame++) {
+        const uint8_t input = stackchan::kantanDemoInput(frame);
+        const bool pressesDemoGesture = input == (gb::BTN_SELECT | gb::BTN_A);
+        const bool pressesDirection = (input & 0x0F) != 0;
+        if (pressesDirection) return false;
+        if (pressesDemoGesture) pressedFrames++;
+        if ((input & gb::BTN_A) && !(previous & gb::BTN_A)) risingEdges++;
+        previous = input;
+    }
+    return risingEdges == 1 && pressedFrames == stackchan::KANTAN_DEMO_PRESS_FRAME_COUNT && previous == 0;
+}
+
+struct RhythmTraceState {
+    uint8_t previousControl = 0x03;
+    uint32_t fifoHash = 2166136261u;
+    uint32_t fifoBytes = 0;
+};
+
+void traceChromaticEvents(gb::ChromaticFM& fm, uint32_t frame, RhythmTraceState& state) {
+    gb::ChromaticEvent event;
+    while (fm.popDeferredEvent(event)) {
+        const bool startsAdpcm =
+            event.type == gb::ChromaticEventType::Control && !(state.previousControl & 0x08) && (event.value & 0x08);
+        const bool changesControl = event.type == gb::ChromaticEventType::Control;
+        const bool writesFifo = event.type == gb::ChromaticEventType::FifoWrite;
+        const bool keysOnYm =
+            event.type == gb::ChromaticEventType::YmWrite && event.address == 0x08 && (event.value & 0x78);
+        if (writesFifo) {
+            state.fifoHash = (state.fifoHash ^ event.value) * 16777619u;
+            state.fifoBytes++;
+        }
+        if (startsAdpcm) {
+            std::printf("rhythm,adpcm_start,frame=%u,sample=%u,control=%02x,bytes=%u,hash=%08x\n", frame, event.sample,
+                        event.value, state.fifoBytes, state.fifoHash);
+            state.fifoHash = 2166136261u;
+            state.fifoBytes = 0;
+        }
+        if (keysOnYm) {
+            std::printf("rhythm,ym_key_on,frame=%u,sample=%u,channel=%u,slots=%02x\n", frame, event.sample,
+                        event.value & 7, event.value & 0x78);
+        }
+        if (changesControl) state.previousControl = event.value;
+    }
 }
 
 }   // namespace
@@ -107,6 +184,11 @@ int runVerification(int argc, char** argv) {
 
     const bool usesExternalRom = argc > 2;
     const bool enablesFm = argc > 3 && std::strcmp(argv[3], "--fm") == 0;
+    const bool tracesRhythm = argc > 4 && std::strcmp(argv[4], "--trace-rhythm") == 0;
+    if (!verifyKantanDemoInput()) {
+        std::fprintf(stderr, "KANTAN demo input contract failed\n");
+        return 1;
+    }
     if (enablesFm && !verifyChromaticV4()) {
         std::fprintf(stderr, "Chromatic v4 register contract failed\n");
         return 1;
@@ -119,17 +201,31 @@ int runVerification(int argc, char** argv) {
     auto system = std::make_unique<gb::GB>();
     system->apu.setSampleRate(44100.0);
     system->fm.enabled = enablesFm;
+    system->fm.deferred = tracesRhythm;
     if (!system->loadRom(rom.data(), rom.size())) {
         std::fprintf(stderr, "%s ROM was rejected\n", usesExternalRom ? "external" : "synthetic");
         return 1;
     }
 
     uint32_t audioCrc = 0;
+    RhythmTraceState rhythmTrace;
+    uint8_t previousInput = 0;
     for (int frame = 0; frame < frames; frame++) {
-        const bool pressRight = frame >= 30 && frame < 60;
-        const bool pressA = frame >= 90 && frame < 100;
-        system->buttons = (pressRight ? gb::BTN_RIGHT : 0) | (pressA ? gb::BTN_A : 0);
+        if (tracesRhythm) {
+            system->buttons = stackchan::kantanDemoInput(static_cast<uint32_t>(frame));
+        } else {
+            const bool pressRight = frame >= 30 && frame < 60;
+            const bool pressA = frame >= 90 && frame < 100;
+            system->buttons = (pressRight ? gb::BTN_RIGHT : 0) | (pressA ? gb::BTN_A : 0);
+        }
+        const bool startsChordInput = tracesRhythm && (system->buttons & gb::BTN_A) && !(previousInput & gb::BTN_A);
+        if (startsChordInput) {
+            std::printf("rhythm,chord_input,frame=%u,sample=%u,direction=%02x\n", frame, system->fm.sampleCursor,
+                        system->buttons & 0x0F);
+        }
+        previousInput = system->buttons;
         system->runFrame();
+        if (tracesRhythm) traceChromaticEvents(system->fm, static_cast<uint32_t>(frame), rhythmTrace);
         audioCrc ^= crc32(system->apu.sampleBuf, (size_t)system->apu.sampleCount * 2 * sizeof(float));
         system->apu.sampleCount = 0;
     }

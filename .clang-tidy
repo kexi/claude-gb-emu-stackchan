@@ -11,5 +11,6 @@ Checks: >
   -performance-enum-size,
   -performance-trivially-destructible
 HeaderFilterRegex: '(core|m5stack/src)/.*\.h$'
+ExcludeHeaderFilterRegex: 'core/ymfm/.*'
 WarningsAsErrors: '*'
 FormatStyle: file

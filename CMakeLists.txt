@@ -22,3 +22,6 @@ target_include_directories(gb_embedded_core PUBLIC core)
 
 add_executable(verify_embedded tools/verify_host.cpp)
 target_link_libraries(verify_embedded PRIVATE gb_embedded_core)
+
+add_executable(verify_chromatic_audio tools/verify_chromatic_audio.cpp)
+target_link_libraries(verify_chromatic_audio PRIVATE gb_embedded_core)

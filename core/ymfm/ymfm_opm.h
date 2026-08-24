@@ -153,6 +153,32 @@ public:
 	// handle writes to the register array
 	bool write(uint16_t index, uint8_t data, uint32_t &chan, uint32_t &opmask);
 
+	// Return the channels whose derived operator cache can change after a
+	// register write. OPM channel/operator registers encode the channel in
+	// their low three bits; global LFO/test registers still invalidate all.
+	static constexpr uint32_t modified_channels(uint16_t index, uint8_t data)
+	{
+		const bool is_channel_or_operator_register = index >= 0x20;
+		if (is_channel_or_operator_register)
+			return 1U << (index & 7);
+
+		const bool is_key_on_register = index == 0x08;
+		if (is_key_on_register)
+			return 1U << (data & 7);
+
+		const bool is_noise_register = index == 0x0f;
+		if (is_noise_register)
+			return 1U << 7;
+
+		const bool is_timer_register = index >= 0x10 && index <= 0x14;
+		if (is_timer_register)
+			return 0;
+
+		// Why not narrow unknown system registers: test/LFO behavior can alter
+		// every channel, and these writes are rare compared with note traffic.
+		return ALL_CHANNELS;
+	}
+
 	// clock the noise and LFO, if present, returning LFO PM value
 	int32_t clock_noise_and_lfo();
 

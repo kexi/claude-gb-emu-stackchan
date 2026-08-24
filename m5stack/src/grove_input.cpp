@@ -111,5 +111,5 @@ void groveInputInit() {
     M5.Ex_I2C.begin(M5.Ex_I2C.getPort(), JOY_I2C_SDA, JOY_I2C_SCL);
     joyKind = probeJoystick();
     groveJoystickKind.store(joyKind, std::memory_order_relaxed);
-    xTaskCreatePinnedToCore(groveTask, "grove", 3072, nullptr, 3, nullptr, 0);
+    xTaskCreatePinnedToCore(groveTask, "grove", 3072, nullptr, GROVE_TASK_PRIORITY, nullptr, 0);
 }

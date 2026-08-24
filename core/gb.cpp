@@ -33,6 +33,7 @@ void GB::reset() {
     apu.reset();
 #ifdef GB_EMBEDDED
     apuPendingCycles = 0;
+    haltFastForwardCount = haltFastForwardCycles = 0;
 #endif
     memset(vram, 0, sizeof(vram));
     memset(wram, 0, sizeof(wram));
@@ -249,8 +250,8 @@ void GB::tickTimer(int cpuCycles) {
     divCounter = (uint16_t)end;
     if (!(tac & 4)) return;
 
-    const uint32_t period = 1u << (TAC_BIT[tac & 3] + 1);
-    const uint32_t fallingEdges = end / period - start / period;
+    const uint32_t periodShift = TAC_BIT[tac & 3] + 1;
+    const uint32_t fallingEdges = (end >> periodShift) - (start >> periodShift);
     for (uint32_t edge = 0; edge < fallingEdges; edge++) {
         if (++tima == 0) {
             tima = tma;
@@ -304,6 +305,29 @@ void GB::tick(int cpuCycles) {
 }
 
 #ifdef GB_EMBEDDED
+int GB::haltDeadlineCycles(int budget) const {
+    int deadline = budget;
+    const int ppuCyclesPerDot = doubleSpeed ? 2 : 1;
+    const int ppuDeadline = ppu.dotsUntilNextEvent() * ppuCyclesPerDot;
+    if (ppuDeadline < deadline) deadline = ppuDeadline;
+
+    const bool timerEnabled = (tac & 4) != 0;
+    if (timerEnabled) {
+        static constexpr int TIMER_PERIOD_SHIFT[4] = {10, 4, 6, 8};
+        const int period = 1 << TIMER_PERIOD_SHIFT[tac & 3];
+        const int phase = divCounter & (period - 1);
+        const int firstFallingEdge = period - phase;
+        const int timerDeadline = firstFallingEdge + (255 - tima) * period;
+        if (timerDeadline < deadline) deadline = timerDeadline;
+    }
+    if (serialCounter > 0 && serialCounter < deadline) deadline = serialCounter;
+
+    // HALT advances in four T-cycle steps. Rounding up reproduces the scalar
+    // loop when a peripheral transition lands in the middle of a HALT step.
+    const int roundedDeadline = (deadline + 3) & ~3;
+    return roundedDeadline < 4 ? 4 : roundedDeadline;
+}
+
 void GB::flushApu() {
     if (apuPendingCycles <= 0) return;
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
@@ -329,7 +353,20 @@ void GB::runFrame() {
         const uint32_t cpuStartedCycles = esp_cpu_get_ccount();
         const uint64_t apuCyclesBefore = profileApuCycles;
 #endif
+#ifdef GB_EMBEDDED
+        const bool interruptPending = (ifReg & ieReg & 0x1F) != 0;
+        const bool canFastForwardHalt = cpu.halted && cpu.imeDelay == 0 && !interruptPending && !cart.hasRtc;
+        int c;
+        if (canFastForwardHalt) {
+            c = haltDeadlineCycles(budget);
+            haltFastForwardCount++;
+            haltFastForwardCycles += c;
+        } else {
+            c = cpu.step();
+        }
+#else
         int c = cpu.step();
+#endif
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
         const uint32_t cpuAndApuCycles = esp_cpu_get_ccount() - cpuStartedCycles;
         const uint64_t nestedApuCycles = profileApuCycles - apuCyclesBefore;

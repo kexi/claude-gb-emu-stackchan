@@ -1,6 +1,7 @@
 .direnv/
 result
 m5stack/.pio/
+m5stack/.cache/
 m5stack/compile_commands.json
 .stackchan/diagnostics/
 .stackchan/cmake/

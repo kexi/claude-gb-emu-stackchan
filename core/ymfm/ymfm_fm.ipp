@@ -31,6 +31,14 @@
 namespace ymfm
 {
 
+#ifndef YMFM_PARTIAL_CACHE_INVALIDATION
+#define YMFM_PARTIAL_CACHE_INVALIDATION 1
+#endif
+
+#ifndef YMFM_SKIP_INACTIVE_CHANNEL_CLOCKS
+#define YMFM_SKIP_INACTIVE_CHANNEL_CLOCKS 1
+#endif
+
 //*********************************************************
 //  GLOBAL TABLE LOOKUPS
 //*********************************************************
@@ -1282,18 +1290,24 @@ uint32_t fm_engine_base<RegisterType>::clock(uint32_t chanmask)
 	// update the clock counter
 	m_total_clocks++;
 
-	// if something was modified, prepare
-	// also prepare every 4k samples to catch ending notes
-	if (m_modified_channels != 0 || m_prepare_count++ >= 4096)
+	// Rebuild only caches touched by register writes. A periodic full pass
+	// still discovers channels whose release envelopes have become silent.
+	const bool periodic_prepare = m_prepare_count++ >= 4096;
+	if (m_modified_channels != 0 || periodic_prepare)
 	{
 		// reassign operators to channels if dynamic
 		if (RegisterType::DYNAMIC_OPS)
 			assign_operators();
 
-		// call each channel to prepare
-		m_active_channels = 0;
+		const uint32_t prepare_mask =
+#if YMFM_PARTIAL_CACHE_INVALIDATION
+			periodic_prepare ? chanmask : (chanmask & m_modified_channels);
+#else
+			chanmask;
+#endif
+		m_active_channels &= ~prepare_mask;
 		for (uint32_t chnum = 0; chnum < CHANNELS; chnum++)
-			if (bitfield(chanmask, chnum))
+			if (bitfield(prepare_mask, chnum))
 				if (m_channel[chnum]->prepare())
 					m_active_channels |= 1 << chnum;
 
@@ -1312,8 +1326,14 @@ uint32_t fm_engine_base<RegisterType>::clock(uint32_t chanmask)
 	int32_t lfo_raw_pm = m_regs.clock_noise_and_lfo();
 
 	// now update the state of all the channels and operators
+	const uint32_t clock_mask =
+#if YMFM_SKIP_INACTIVE_CHANNEL_CLOCKS
+		chanmask & m_active_channels;
+#else
+		chanmask;
+#endif
 	for (uint32_t chnum = 0; chnum < CHANNELS; chnum++)
-		if (bitfield(chanmask, chnum))
+		if (bitfield(clock_mask, chnum))
 			m_channel[chnum]->clock(m_env_counter, lfo_raw_pm);
 
 	// return the envelope counter as it is used to clock ADPCM-A
@@ -1408,8 +1428,14 @@ void fm_engine_base<RegisterType>::write(uint16_t regnum, uint8_t data)
 		return;
 	}
 
-	// for now just mark all channels as modified
+	// OPM exposes the exact cache dependency for each register. Why not
+	// invalidate everything: note traffic otherwise recalculates 32 operator
+	// caches after almost every write on small embedded CPUs.
+#if YMFM_PARTIAL_CACHE_INVALIDATION
+	m_modified_channels |= RegisterType::modified_channels(regnum, data);
+#else
 	m_modified_channels = ALL_CHANNELS;
+#endif
 
 	// most writes are passive, consumed only when needed
 	uint32_t keyon_channel;

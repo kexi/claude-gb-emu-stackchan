@@ -10,9 +10,14 @@
 #include <atomic>
 #include <cstring>
 
+#ifdef GB_PROFILE
+#include <esp_cpu.h>
+#endif
+
 #include "../../core/gb.h"
 #include "config.h"
 #include "grove_input.h"
+#include "kantan_autoplay.h"
 
 extern const uint8_t builtinRomStart[] asm("_binary_data_kantan_gb_play_gbc_start");
 extern const uint8_t builtinRomEnd[] asm("_binary_data_kantan_gb_play_gbc_end");
@@ -66,7 +71,6 @@ uint8_t previousMenuButtons = 0;
 AppMode appMode = AppMode::Menu;
 char currentRomName[ROM_NAME_MAX] = {};
 bool sdMounted = false;
-uint32_t gameStartedMs = 0;
 bool useFmSound = true;
 
 bool displayDmaOutstanding = false;
@@ -85,14 +89,26 @@ int16_t audioChunks[AUDIO_CHUNK_SLOTS][AUDIO_CHUNK_SAMPLES];
 int audioChunkIndex = 0;
 float dcPreviousInput = 0;
 float dcPreviousOutput = 0;
-float resampleSourceRateEwma = AUDIO_SAMPLE_RATE;
-std::atomic<uint32_t> requestedSourceRate{AUDIO_SAMPLE_RATE};
 std::atomic<uint32_t> audioWorkerResetRequest{0};
 std::atomic<uint32_t> audioWorkerResetAck{0};
 std::atomic<bool> audioWorkerShouldRun{false};
 std::atomic<bool> audioWorkerFmMode{true};
 std::atomic<uint32_t> audioWorkerProcessedSample{0};
 std::atomic<uint32_t> audioWorkerBackpressure{0};
+std::atomic<uint32_t> audioWorkerActiveCycles{0};
+std::atomic<uint32_t> audioOutputClipCount{0};
+std::atomic<uint32_t> audioSpeakerQueueEmptyCount{0};
+std::atomic<uint32_t> audioSpeakerQueueFailureCount{0};
+std::atomic<uint32_t> audioChunkBoundaryMaxDelta{0};
+std::atomic<uint32_t> audioAdpcmFifoWriteCount{0};
+std::atomic<uint32_t> audioAdpcmFifoRejectedCount{0};
+std::atomic<uint32_t> audioAdpcmStartCount{0};
+std::atomic<uint32_t> audioAdpcmActiveSampleCount{0};
+std::atomic<uint32_t> audioAdpcmPeak{0};
+std::atomic<uint32_t> audioYmPeak{0};
+std::atomic<uint32_t> audioAlignmentStarts{0};
+std::atomic<uint32_t> audioAlignmentFailures{0};
+std::atomic<uint32_t> audioAlignmentMaximumSpan{0};
 TaskHandle_t audioWorkerHandle = nullptr;
 
 uint32_t observedRamGeneration = 0;
@@ -392,12 +408,10 @@ void requestAudioWorker(bool shouldRun) {
 
 void startGame() {
     appMode = AppMode::Game;
-    gameStartedMs = millis();
     M5.Display.fillScreen(TFT_DARKGREY);
     M5.Display.drawRect(DISPLAY_X - 1, DISPLAY_Y - 1, DISPLAY_WIDTH + 2, DISPLAY_HEIGHT + 2, TFT_CYAN);
     displayBandIndex = 0;
     displayDmaOutstanding = false;
-    resampleSourceRateEwma = AUDIO_SAMPLE_RATE;
     requestAudioWorker(true);
 }
 
@@ -467,9 +481,7 @@ void applyInput() {
     if (M5.BtnA.isPressed()) buttons |= gb::BTN_SELECT;
     if (M5.BtnB.isPressed()) buttons |= gb::BTN_START;
 #ifdef GB_AUTOPLAY_DEMO
-    const uint32_t gameAgeMs = millis() - gameStartedMs;
-    const bool shouldHoldChord = gameAgeMs >= 1500;
-    if (shouldHoldChord) buttons |= gb::BTN_RIGHT | gb::BTN_A;
+    buttons |= stackchan::kantanDemoInput(systemGb.ppu.frameCount);
 #endif
     audioDiagnostic.input = buttons;
     const uint8_t newlyPressed = buttons & ~systemGb.buttons;
@@ -549,25 +561,42 @@ int enqueueAudio() {
 }
 
 void applyFmEvent(gb::ChromaticFM& renderer, const gb::ChromaticEvent& event) {
+    const int fifoCountBefore = renderer.fifoCount;
+    const bool wasPlaying = (renderer.audioControl & 0x08) != 0;
+    renderer.applyDeferredEvent(event);
+
     switch (event.type) {
-    case gb::ChromaticEventType::YmWrite:
-        renderer.write(0, event.address);
-        renderer.write(1, event.value);
-        break;
-    case gb::ChromaticEventType::FifoWrite: renderer.write(2, event.value); break;
-    case gb::ChromaticEventType::Control: renderer.write(3, event.value); break;
-    case gb::ChromaticEventType::VolumeLeft: renderer.write(4, event.value); break;
-    case gb::ChromaticEventType::VolumeRight: renderer.write(5, event.value); break;
+    case gb::ChromaticEventType::FifoWrite: {
+        const bool fifoAcceptedWrite = renderer.fifoCount > fifoCountBefore;
+        if (fifoAcceptedWrite) {
+            audioAdpcmFifoWriteCount.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            audioAdpcmFifoRejectedCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    case gb::ChromaticEventType::Control: {
+        const bool startedPlaying = !wasPlaying && (renderer.audioControl & 0x08) != 0;
+        if (startedPlaying) audioAdpcmStartCount.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    default: return;
     }
 }
 
 void audioWorkerTask(void*) {
     gb::ChromaticFM renderer;
+    gb::ChromaticAudioAligner aligner;
     int mixRead = 0;
     int mixWrite = 0;
     uint32_t resamplePhase = 0;
     uint32_t processedSample = 0;
+    uint32_t lastWorkerIdleSample = 0;
     uint32_t acknowledgedReset = 0;
+    size_t previousSpeakerQueue = 0;
+    int16_t previousChunkLastSample = 0;
+    bool hasPreviousChunk = false;
+    bool alignmentEnabled = false;
     bool running = false;
 
     for (;;) {
@@ -579,22 +608,36 @@ void audioWorkerTask(void*) {
             renderer.enabled = fmMode;
             renderer.deferred = false;
             renderer.reset();
+            aligner.reset();
+#ifdef GB_AUTOPLAY_DEMO
+            aligner.setRhythmStabilization(fmMode);
+#endif
+            alignmentEnabled = fmMode && aligner.failures() == 0;
             audioRead.store(0, std::memory_order_relaxed);
             audioWrite.store(0, std::memory_order_relaxed);
             mixRead = mixWrite = 0;
             audioMixSamples.store(0, std::memory_order_relaxed);
             resamplePhase = 0;
             processedSample = 0;
+            lastWorkerIdleSample = 0;
             dcPreviousInput = dcPreviousOutput = 0;
             audioChunkIndex = 0;
-            if (running) {
-                for (int slot = 0; slot < 2; slot++) {
-                    memset(audioChunks[audioChunkIndex], 0, sizeof(audioChunks[0]));
-                    M5.Speaker.playRaw(audioChunks[audioChunkIndex], AUDIO_CHUNK_SAMPLES, AUDIO_SAMPLE_RATE, false, 1,
-                                       SPEAKER_CHANNEL);
-                    audioChunkIndex = (audioChunkIndex + 1) % AUDIO_CHUNK_SLOTS;
-                }
-            }
+            previousSpeakerQueue = 0;
+            previousChunkLastSample = 0;
+            hasPreviousChunk = false;
+            audioOutputClipCount.store(0, std::memory_order_relaxed);
+            audioSpeakerQueueEmptyCount.store(0, std::memory_order_relaxed);
+            audioSpeakerQueueFailureCount.store(0, std::memory_order_relaxed);
+            audioChunkBoundaryMaxDelta.store(0, std::memory_order_relaxed);
+            audioAdpcmFifoWriteCount.store(0, std::memory_order_relaxed);
+            audioAdpcmFifoRejectedCount.store(0, std::memory_order_relaxed);
+            audioAdpcmStartCount.store(0, std::memory_order_relaxed);
+            audioAdpcmActiveSampleCount.store(0, std::memory_order_relaxed);
+            audioAdpcmPeak.store(0, std::memory_order_relaxed);
+            audioYmPeak.store(0, std::memory_order_relaxed);
+            audioAlignmentStarts.store(0, std::memory_order_relaxed);
+            audioAlignmentFailures.store(aligner.failures(), std::memory_order_relaxed);
+            audioAlignmentMaximumSpan.store(0, std::memory_order_relaxed);
             audioWorkerProcessedSample.store(0, std::memory_order_relaxed);
             acknowledgedReset = requestedReset;
             audioWorkerResetAck.store(requestedReset, std::memory_order_release);
@@ -605,28 +648,59 @@ void audioWorkerTask(void*) {
             continue;
         }
 
+#ifdef GB_PROFILE
+        const uint32_t workerStartedCycles = esp_cpu_get_ccount();
+#endif
         const bool fmMode = audioWorkerFmMode.load(std::memory_order_relaxed);
+        const size_t speakerQueueBefore = M5.Speaker.isPlaying(SPEAKER_CHANNEL);
+        const bool speakerQueueBecameEmpty = previousSpeakerQueue > 0 && speakerQueueBefore == 0;
+        if (speakerQueueBecameEmpty) audioSpeakerQueueEmptyCount.fetch_add(1, std::memory_order_relaxed);
         int inputRead = audioRead.load(std::memory_order_relaxed);
         const int inputWrite = audioWrite.load(std::memory_order_acquire);
         int generated = 0;
-        while (inputRead != inputWrite && ((mixWrite + 1) & AUDIO_MIX_RING_MASK) != mixRead && generated < 128) {
+        uint32_t adpcmActiveSamples = 0;
+        uint32_t adpcmPeak = 0;
+        uint32_t ymPeak = 0;
+        for (;;) {
+            const int inputAvailable = (inputWrite - inputRead) & AUDIO_RING_MASK;
+            const uint32_t requiredLookahead = alignmentEnabled ? AUDIO_ALIGNMENT_LOOKAHEAD_SAMPLES : 0;
+            const bool hasAlignedInput = inputAvailable > static_cast<int>(requiredLookahead);
+            const bool mixHasRoom = ((mixWrite + 1) & AUDIO_MIX_RING_MASK) != mixRead;
+            const bool canGenerate = hasAlignedInput && mixHasRoom && generated < 128;
+            if (!canGenerate) break;
+
             gb::ChromaticEvent event;
-            while (fmMode && systemGb.fm.peekDeferredEvent(event) && event.sample <= processedSample) {
+            const uint32_t rawHorizon = processedSample + requiredLookahead;
+            while (fmMode && systemGb.fm.peekDeferredEvent(event) && event.sample <= rawHorizon) {
                 systemGb.fm.popDeferredEvent(event);
-                applyFmEvent(renderer, event);
+                if (alignmentEnabled) {
+                    aligner.ingest(event);
+                } else {
+                    applyFmEvent(renderer, event);
+                }
             }
+            if (alignmentEnabled) aligner.advanceRawHorizon(rawHorizon);
+            while (alignmentEnabled && aligner.popDueEvent(processedSample, event)) applyFmEvent(renderer, event);
 
             float mixed = audioRing[inputRead] / 32768.0f;
             inputRead = (inputRead + 1) & AUDIO_RING_MASK;
             if (fmMode) {
                 renderer.generateSample(AUDIO_SAMPLE_RATE);
+                const float ymMono = (renderer.ymL + renderer.ymR) * 0.5f;
+                const uint32_t ymMagnitude = (uint32_t)(std::abs(ymMono) * 32767.0f);
+                const uint32_t adpcmMagnitude = (uint32_t)(std::abs(renderer.adpcmOut) * 32767.0f);
+                if (ymMagnitude > ymPeak) ymPeak = ymMagnitude;
+                if (adpcmMagnitude > adpcmPeak) adpcmPeak = adpcmMagnitude;
+                if (renderer.adpcmActive) adpcmActiveSamples++;
                 if (renderer.audioControl & 0x01) mixed += (renderer.ymL + renderer.ymR) * 0.5f;
-                if (renderer.audioControl & 0x04) mixed += renderer.adpcmOut * 0.5f;
+                if (renderer.audioControl & 0x04) mixed += renderer.adpcmOut * ADPCM_MIX_GAIN;
             }
             const float filtered = mixed - dcPreviousInput + 0.9985f * dcPreviousOutput;
             dcPreviousInput = mixed;
             dcPreviousOutput = filtered;
             float scaled = filtered * 0.9f;
+            const bool outputClipped = scaled > 1.0f || scaled < -1.0f;
+            if (outputClipped) audioOutputClipCount.fetch_add(1, std::memory_order_relaxed);
             if (scaled > 1.0f) scaled = 1.0f;
             if (scaled < -1.0f) scaled = -1.0f;
             audioMixRing[mixWrite] = (int16_t)(scaled * 32767.0f);
@@ -634,16 +708,31 @@ void audioWorkerTask(void*) {
             processedSample++;
             generated++;
         }
+        audioAlignmentStarts.store(aligner.compensatedStarts(), std::memory_order_relaxed);
+        audioAlignmentFailures.store(aligner.failures(), std::memory_order_relaxed);
+        audioAlignmentMaximumSpan.store(aligner.maximumPreloadSpan(), std::memory_order_relaxed);
+        if (adpcmActiveSamples > 0) {
+            audioAdpcmActiveSampleCount.fetch_add(adpcmActiveSamples, std::memory_order_relaxed);
+        }
+        uint32_t previousYmPeak = audioYmPeak.load(std::memory_order_relaxed);
+        while (ymPeak > previousYmPeak &&
+               !audioYmPeak.compare_exchange_weak(previousYmPeak, ymPeak, std::memory_order_relaxed)) {}
+        uint32_t previousAdpcmPeak = audioAdpcmPeak.load(std::memory_order_relaxed);
+        while (adpcmPeak > previousAdpcmPeak &&
+               !audioAdpcmPeak.compare_exchange_weak(previousAdpcmPeak, adpcmPeak, std::memory_order_relaxed)) {}
         audioRead.store(inputRead, std::memory_order_release);
         audioWorkerProcessedSample.store(processedSample, std::memory_order_relaxed);
 
-        int mixedAvailable = (mixWrite - mixRead) & AUDIO_MIX_RING_MASK;
-        const uint32_t sourceRate = requestedSourceRate.load(std::memory_order_relaxed);
+        constexpr uint32_t sourceRate = AUDIO_SAMPLE_RATE;
         const uint32_t sourceStep =
             ((uint64_t)sourceRate * AUDIO_RESAMPLE_ONE + AUDIO_SAMPLE_RATE / 2) / AUDIO_SAMPLE_RATE;
+        int mixedAvailable = (mixWrite - mixRead) & AUDIO_MIX_RING_MASK;
         const uint64_t lastOutputPhase = resamplePhase + (uint64_t)sourceStep * (AUDIO_CHUNK_SAMPLES - 1);
         const int requiredSourceSamples = (int)(lastOutputPhase / AUDIO_RESAMPLE_ONE) + 2;
-        const bool canQueue = mixedAvailable >= requiredSourceSamples && M5.Speaker.isPlaying(SPEAKER_CHANNEL) < 2;
+        const bool hasStartupBuffer = hasPreviousChunk || mixedAvailable >= requiredSourceSamples * 2;
+        const bool canQueue =
+            hasStartupBuffer && mixedAvailable >= requiredSourceSamples && M5.Speaker.isPlaying(SPEAKER_CHANNEL) < 2;
+        bool queuedAny = false;
         if (canQueue) {
             int16_t* chunk = audioChunks[audioChunkIndex];
             uint64_t phase = resamplePhase;
@@ -655,51 +744,54 @@ void audioWorkerTask(void*) {
                 chunk[sample] = (int16_t)(first + (((int64_t)(second - first) * fraction) >> 16));
                 phase += sourceStep;
             }
+            if (!hasPreviousChunk) {
+                // The amplifier starts only after two real chunks are ready.
+                // Fade the first chunk in so its first non-zero sample cannot
+                // create a power-on discontinuity at the speaker.
+                for (int sample = 0; sample < AUDIO_CHUNK_SAMPLES; sample++) {
+                    chunk[sample] = (int16_t)(((int32_t)chunk[sample] * sample) / (AUDIO_CHUNK_SAMPLES - 1));
+                }
+            }
             const bool queued =
                 M5.Speaker.playRaw(chunk, AUDIO_CHUNK_SAMPLES, AUDIO_SAMPLE_RATE, false, 1, SPEAKER_CHANNEL);
             if (queued) {
+                if (hasPreviousChunk) {
+                    const int delta = std::abs((int)chunk[0] - previousChunkLastSample);
+                    uint32_t previousMax = audioChunkBoundaryMaxDelta.load(std::memory_order_relaxed);
+                    while ((uint32_t)delta > previousMax && !audioChunkBoundaryMaxDelta.compare_exchange_weak(
+                                                                previousMax, delta, std::memory_order_relaxed)) {}
+                }
+                previousChunkLastSample = chunk[AUDIO_CHUNK_SAMPLES - 1];
+                hasPreviousChunk = true;
                 mixRead = (mixRead + phase / AUDIO_RESAMPLE_ONE) & AUDIO_MIX_RING_MASK;
                 resamplePhase = (uint32_t)phase & (AUDIO_RESAMPLE_ONE - 1);
                 audioDiagnostic.chunksQueued++;
                 audioChunkIndex = (audioChunkIndex + 1) % AUDIO_CHUNK_SLOTS;
+                queuedAny = true;
+            } else {
+                audioSpeakerQueueFailureCount.fetch_add(1, std::memory_order_relaxed);
             }
         }
         mixedAvailable = (mixWrite - mixRead) & AUDIO_MIX_RING_MASK;
         audioMixSamples.store(mixedAvailable, std::memory_order_relaxed);
-        audioDiagnostic.speakerQueue = M5.Speaker.isPlaying(SPEAKER_CHANNEL);
+        const size_t speakerQueueAfter = M5.Speaker.isPlaying(SPEAKER_CHANNEL);
+        previousSpeakerQueue = speakerQueueAfter;
+        audioDiagnostic.speakerQueue = speakerQueueAfter;
         audioDiagnostic.speakerRunning = M5.Speaker.isRunning();
-        if (generated == 0 && !canQueue) ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
+#ifdef GB_PROFILE
+        const bool workerDidWork = generated > 0 || queuedAny;
+        if (workerDidWork) {
+            audioWorkerActiveCycles.fetch_add(esp_cpu_get_ccount() - workerStartedCycles, std::memory_order_relaxed);
+        }
+#endif
+        const bool idleTaskNeedsCpu = processedSample - lastWorkerIdleSample >= AUDIO_WORKER_IDLE_INTERVAL_SAMPLES;
+        if (idleTaskNeedsCpu) {
+            lastWorkerIdleSample = processedSample;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        } else if (generated == 0 && !queuedAny) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
+        }
     }
-}
-
-uint32_t updateResampleSourceRate(uint32_t current, int produced, int64_t wallFrameUs) {
-    static float averageProduced = AUDIO_SAMPLE_RATE * GB_FRAME_US / 1000000.0f;
-    static float averageFrameUs = GB_FRAME_US;
-    static int warmupFrames = AUDIO_RATE_WARMUP_FRAMES;
-
-    const bool observationUsable = wallFrameUs > 0 && produced > 0;
-    if (observationUsable) {
-        averageProduced += AUDIO_RATE_EWMA_ALPHA * ((float)produced - averageProduced);
-        averageFrameUs += AUDIO_RATE_EWMA_ALPHA * ((float)wallFrameUs - averageFrameUs);
-    }
-    const float measuredRate = averageProduced * 1000000.0f / averageFrameUs;
-    float correction = (audioAvailable() - AUDIO_RING_TARGET) * AUDIO_RATE_FEEDBACK_GAIN;
-    const float correctionLimit = measuredRate * AUDIO_RATE_FEEDBACK_MAX;
-    if (correction > correctionLimit) correction = correctionLimit;
-    if (correction < -correctionLimit) correction = -correctionLimit;
-    float target = measuredRate + correction;
-
-    if (target > AUDIO_RATE_MAX) target = AUDIO_RATE_MAX;
-    if (target < AUDIO_RATE_MIN) target = AUDIO_RATE_MIN;
-
-    if (warmupFrames > 0) {
-        warmupFrames--;
-        return (uint32_t)(target + 0.5f);
-    }
-    const float slew = current * AUDIO_RATE_SLEW_MAX;
-    if (target < current - slew) target = current - slew;
-    if (target > current + slew) target = current + slew;
-    return (uint32_t)(target + 0.5f);
 }
 
 void maybeSaveSram() {
@@ -716,7 +808,6 @@ void maybeSaveSram() {
 
 void gameLoop() {
     static int64_t nextFrameUs = esp_timer_get_time();
-    static int64_t previousStartUs = esp_timer_get_time();
     static uint32_t perfStartedMs = millis();
     static uint32_t perfFrames = 0;
     static uint64_t perfFrameUs = 0;
@@ -731,8 +822,6 @@ void gameLoop() {
 #endif
 
     const int64_t frameStartUs = esp_timer_get_time();
-    const int64_t wallFrameUs = frameStartUs - previousStartUs;
-    previousStartUs = frameStartUs;
 
     const bool shouldPollM5 = systemGb.ppu.frameCount % M5_UPDATE_FRAME_DIVIDER == 0;
     if (shouldPollM5) M5.update();
@@ -750,10 +839,8 @@ void gameLoop() {
     systemGb.runFrame();
     const int64_t emulationEndUs = esp_timer_get_time();
     const int64_t emulationUs = emulationEndUs - emulationStartUs;
-    const int produced = enqueueAudio();
-    const uint32_t sourceRate = updateResampleSourceRate((uint32_t)resampleSourceRateEwma, produced, wallFrameUs);
-    resampleSourceRateEwma = sourceRate;
-    requestedSourceRate.store(sourceRate, std::memory_order_relaxed);
+    enqueueAudio();
+    constexpr uint32_t sourceRate = AUDIO_SAMPLE_RATE;
     audioDiagnostic.ringSamples = audioAvailable();
     const int64_t audioEndUs = esp_timer_get_time();
 
@@ -773,6 +860,7 @@ void gameLoop() {
     perfPpuCycles += systemGb.profilePpuCycles;
     perfApuCycles += systemGb.profileApuCycles;
 #endif
+#ifdef GB_PROFILE
     const uint32_t nowMs = millis();
     if (nowMs - perfStartedMs >= PERF_LOG_INTERVAL_MS) {
         const float seconds = (nowMs - perfStartedMs) / 1000.0f;
@@ -789,18 +877,44 @@ void gameLoop() {
                       AUDIO_SAMPLE_RATE, sourceRate, ESP.getFreeHeap(), ESP.getFreePsram());
         Serial.printf("{\"component\":\"runtime\",\"event\":\"frontend_profile\",\"frame\":%u,"
                       "\"input_us\":%u,\"audio_us\":%u,\"display_us\":%u,\"save_us\":%u,"
-                      "\"fm_processed_sample\":%u,\"audio_backpressure\":%u,\"event_backpressure\":%u}\n",
+                      "\"fm_processed_sample\":%u,\"audio_backpressure\":%u,\"event_backpressure\":%u,"
+                      "\"event_high_water\":%u,\"halt_fast_forwards\":%u,"
+                      "\"halt_fast_forward_cycles\":%u,\"audio_output_clips\":%u,"
+                      "\"speaker_queue_empty\":%u,\"speaker_queue_failures\":%u,"
+                      "\"chunk_boundary_max_delta\":%u,\"adpcm_fifo_writes\":%u,"
+                      "\"adpcm_fifo_rejected\":%u,\"adpcm_starts\":%u,"
+                      "\"adpcm_active_samples\":%u,\"adpcm_peak\":%u,\"ym_peak\":%u,"
+                      "\"alignment_lookahead_samples\":%u,\"alignment_starts\":%u,"
+                      "\"alignment_failures\":%u,\"alignment_maximum_span_samples\":%u}\n",
                       systemGb.ppu.frameCount, (unsigned)(perfInputUs / perfFrames),
                       (unsigned)(perfAudioUs / perfFrames), (unsigned)(perfDisplayUs / perfFrames),
                       (unsigned)(perfSaveUs / perfFrames), audioWorkerProcessedSample.load(std::memory_order_relaxed),
-                      audioWorkerBackpressure.load(std::memory_order_relaxed), systemGb.fm.eventBackpressureCount);
+                      audioWorkerBackpressure.load(std::memory_order_relaxed), systemGb.fm.eventBackpressureCount,
+                      systemGb.fm.eventHighWater, systemGb.haltFastForwardCount, systemGb.haltFastForwardCycles,
+                      audioOutputClipCount.load(std::memory_order_relaxed),
+                      audioSpeakerQueueEmptyCount.load(std::memory_order_relaxed),
+                      audioSpeakerQueueFailureCount.load(std::memory_order_relaxed),
+                      audioChunkBoundaryMaxDelta.load(std::memory_order_relaxed),
+                      audioAdpcmFifoWriteCount.exchange(0, std::memory_order_relaxed),
+                      audioAdpcmFifoRejectedCount.exchange(0, std::memory_order_relaxed),
+                      audioAdpcmStartCount.exchange(0, std::memory_order_relaxed),
+                      audioAdpcmActiveSampleCount.exchange(0, std::memory_order_relaxed),
+                      audioAdpcmPeak.exchange(0, std::memory_order_relaxed),
+                      audioYmPeak.exchange(0, std::memory_order_relaxed), AUDIO_ALIGNMENT_LOOKAHEAD_SAMPLES,
+                      audioAlignmentStarts.load(std::memory_order_relaxed),
+                      audioAlignmentFailures.load(std::memory_order_relaxed),
+                      audioAlignmentMaximumSpan.load(std::memory_order_relaxed));
+        systemGb.fm.eventHighWater = 0;
+        systemGb.haltFastForwardCount = systemGb.haltFastForwardCycles = 0;
 #ifdef GB_PROFILE
         constexpr uint32_t CPU_CYCLES_PER_US = 240;
+        const uint32_t workerActiveUs =
+            audioWorkerActiveCycles.exchange(0, std::memory_order_relaxed) / CPU_CYCLES_PER_US;
         Serial.printf("{\"component\":\"runtime\",\"event\":\"profile\",\"frame\":%u,"
-                      "\"cpu_us\":%u,\"ppu_us\":%u,\"apu_us\":%u}\n",
+                      "\"cpu_us\":%u,\"ppu_us\":%u,\"apu_us\":%u,\"audio_worker_active_us\":%u}\n",
                       systemGb.ppu.frameCount, (unsigned)(perfCpuCycles / perfFrames / CPU_CYCLES_PER_US),
                       (unsigned)(perfPpuCycles / perfFrames / CPU_CYCLES_PER_US),
-                      (unsigned)(perfApuCycles / perfFrames / CPU_CYCLES_PER_US));
+                      (unsigned)(perfApuCycles / perfFrames / CPU_CYCLES_PER_US), workerActiveUs);
         perfCpuCycles = perfPpuCycles = perfApuCycles = 0;
 #endif
         perfStartedMs = nowMs;
@@ -808,6 +922,7 @@ void gameLoop() {
         perfFrameUs = 0;
         perfInputUs = perfAudioUs = perfDisplayUs = perfSaveUs = 0;
     }
+#endif
 
     nextFrameUs += GB_FRAME_US;
     const int64_t remainingUs = nextFrameUs - esp_timer_get_time();
@@ -856,8 +971,10 @@ void setup() {
 
     auto speakerConfig = M5.Speaker.config();
     speakerConfig.sample_rate = AUDIO_SAMPLE_RATE;
+    speakerConfig.dma_buf_len = SPEAKER_DMA_BUFFER_SAMPLES;
+    speakerConfig.dma_buf_count = SPEAKER_DMA_BUFFER_COUNT;
     speakerConfig.task_pinned_core = 0;
-    speakerConfig.task_priority = 4;
+    speakerConfig.task_priority = SPEAKER_TASK_PRIORITY;
     M5.Speaker.config(speakerConfig);
     const bool speakerStarted = M5.Speaker.begin();
     audioDiagnostic.speakerRunning = M5.Speaker.isRunning();
@@ -869,8 +986,8 @@ void setup() {
         delay(140);
         M5.Speaker.stop(0);
     }
-    const BaseType_t workerCreated =
-        xTaskCreatePinnedToCore(audioWorkerTask, "fm_audio", 6144, nullptr, 2, &audioWorkerHandle, 0);
+    const BaseType_t workerCreated = xTaskCreatePinnedToCore(audioWorkerTask, "fm_audio", 6144, nullptr,
+                                                             AUDIO_WORKER_TASK_PRIORITY, &audioWorkerHandle, 0);
     if (workerCreated != pdPASS) showFatal("Audio worker failed");
 
     scanRoms();

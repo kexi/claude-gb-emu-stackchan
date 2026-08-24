@@ -5,7 +5,7 @@ description: ブラウザ向け GB/GBC コアを M5Stack CoreS3 上で安全か�
 tags: [architecture, embedded, emulator, performance, stackchan]
 status: draft
 generated: { by: codex/gpt-5, at: 2026-08-24T00:00:00+09:00 }
-verified: { by: process:codex-host-crc-and-cores3-runtime-measurement, at: 2026-08-24T18:30:00+09:00 }
+verified: { by: process:codex-host-sample-parity-and-cores3-runtime-measurement, at: 2026-08-25T00:00:00+09:00 }
 sources:
   - id: local-gb-core
     resource: ../core
@@ -38,6 +38,10 @@ sources:
     resource: ../core/ymfm
     title: Aaron Giles ymfm YM2151 implementation (BSD-3-Clause)
     author: person:Aaron-Giles
+  - id: mame-msm6258
+    resource: https://github.com/mamedev/mame/blob/master/src/devices/sound/okim6258.cpp
+    title: MAME OKI MSM6258 reference implementation
+    author: team:mamedev
 ---
 
 # 目的と完了条件
@@ -103,9 +107,9 @@ CoreS3 では PPU の pixel 型を byte-swapped RGB565 にし、M5GFX の `setSw
 
 # 音声とペーシング
 
-コアは44.1 kHz stereo floatを生成する。CoreS3フロントエンドで左右平均、saturating int16変換、DC blockerを行い、8,192 sampleのpower-of-two ringへ積む。ringの中央4,096 sampleを目標に、16.16固定小数点の位相連続linear resamplerで512 sampleの出力chunkを作る。M5Unifiedへ渡す再生rateは常に44.1 kHzに固定し、エミュレーション速度とI2S clockの微差はresamplerのsource stepだけで吸収する。再生中ポインタを上書きしないよう4 slotを回し、M5Unifiedの2 slot speaker queueが埋まっている間は`playRaw`を呼ばない。
+コアは44.1 kHz stereo floatを生成する。CoreS3フロントエンドで左右平均、saturating int16変換、DC blockerを行い、8,192 sampleのpower-of-two ringへ積む。16.16固定小数点の位相連続linear resamplerで512 sampleの出力chunkを作るが、sourceとM5Unifiedの再生rateはともに常時44.1 kHzとする。再生中ポインタを上書きしないよう4 slotを回し、M5Unifiedの2 slot speaker queueが埋まっている間は`playRaw`を呼ばない。
 
-GBの目標フレーム周期は70,224 / 4,194,304 = 約16.7427 ms（約59.7275 Hz）。処理がこれより速い場合はフレーム境界で待つ。遅い場合もspeaker clockをchunkごとに変更しない。実測sample生産率とring深さからresampler source rateだけをslew制限付きで追従させ、waveformの位相とspeaker queueの時間軸を連続に保つ。
+GBの目標フレーム周期は70,224 / 4,194,304 = 約16.7427 ms（約59.7275 Hz）。処理がこれより速い場合はフレーム境界で待つ。遅延はPCM ringとspeaker DMAで吸収し、wall-clock上の短期的なfps揺れをresampler source rateへ反映しない。1 emulated frameが生成するsample数はCPU cycle基準で決まるため、source rateを変えるとゲーム本来の音程を変調してしまう。
 
 CoreS3の内蔵speakerと内蔵micはBCLK/WSとI2S1を共有する。M5Unified 0.2.15は両者を別driverとして排他的に扱い、公式microphone exampleも録音時にspeakerを停止する。このため現行APIだけではspeakerの音響loopbackを内蔵micで同時収録できない。自動click評価を追加する場合は通常firmwareから分離した`audio-lab`環境で、ESP-IDFのI2S TX+RX full-duplex driverへ所有権を一本化して検証する。通常版へ未検証のcodec制御を混ぜない。
 
@@ -129,6 +133,10 @@ JITは将来候補から除外しないが、実装開始のgateを「FM worker�
 
 入力は既存の NES 実装と配線を共有し、GB bit 配置へ変換する。Joystick の上下左右、Dual Button の A/B、画面下部の Select/Start/メニュー長押しを使う。I2C の未接続・読み取り失敗はボタンを離した状態へ戻し、エミュレーションを止めない。
 
+KANTANの自動演奏はフロントエンド側でコード進行を生成しない。固定ROMのソースが持つ内蔵デモを`SELECT+A`の単一edgeで開始し、4 emulated frame後に全自動入力を解放する。以後のコード、ベース、YM channel 7 noise、ADPCMドラムはROM自身の155 BPM・12 main-loop iteration/eighthのグリッドだけで進める。これによりwall clock、PPU frame、audio sampleからROMの拍位置を外挿する経路をなくす。
+
+内蔵デモの累積ドリフトをなくしても、固定ROMの`adpcm_play()`は`STOP → 160 byte prime → PLAY`の順なので、同じgrid stepのYM chord key-onよりADPCM play edgeが遅れる。ROM改変案は診断だけに留め、固定ROMとCPU-visibleなregister/FIFO/status、生event timestampは変更しない。FM再生時だけCoreS3のPCM入力を2,048 samples（約46.4 ms）保持し、音響consumerが同じ窓の未来eventを確認する。`STOP → preload → PLAY`が窓内で完結するときは、立下りSTOPを保留し、受理済みpreloadとPLAYを新しいトランザクションの同じ音響sampleへまとめる。PLAY後のstreaming feedは同じ補正量だけ移すが、次のSTOPへ前回の補正量を持ち越さない。直後のserialized YM onset burstも新しいトランザクションに合わせる。これによりFIFO供給速度を保ったままコード、ADPCM、YM noiseハイハット、ベースを約2 ms内へ収める。2,048 samplesを超えるpreloadは生時刻のままfail-openし、PSG選択時は保持を行わない。
+
 # 観測と検証
 
 本番ログは 1 秒単位の JSONL とし、`event`、`frame`、`fps`、`frame_us`、`audio_ring_samples`、`audio_underruns`、`audio_dropped`、`playback_rate_hz`、`resample_source_rate_hz`、`heap_free_bytes`、`psram_free_bytes`、`display_mode`を一貫した名前で出す。frontend区間は`input_us`、`audio_us`、`display_us`、`save_us`を分離し、計測ビルドだけはコア内部のCPU / PPU / APU cycleも追加する。
@@ -140,6 +148,8 @@ JITは将来候補から除外しないが、実装開始のgateを「FM worker�
 3. PlatformIO の通常ビルドと計測ビルドを通す。
 4. 実機では ROM 起動、入力全ボタン、LCD の tearing、音声 underrun、SD 抜き差し、SRAM 復元を監督下で確認する。
 5. 30 秒以上のログで p95 frame time と最小 audio ring を見てから、第 2 段階の CPU dispatch / IRAM / bank cache の要否を決める。
+6. KANTAN内蔵デモでは同期rendererとdeferred event replayを同じROM・入力で実行し、eventをtimestampのsample生成直前に適用したstereo PCMがsample単位で完全一致することを確認する。
+7. 固定KANTAN ROMの音響整列後は、CH2 key-onからADPCM playまで64 samples以下、ADPCM playからYM noiseハイハットまで64 samples以下、ベースまで128 samples以下、全one-shotでFIFO starvation 0、alignment failure 0とする。さらに連続打音では有効STOP→PLAY間隔を0 sample、再トリガー境界の出力段差を1 LSB以下とする。10分間の内蔵デモでoffset変動1 sample以下、FIFO reject、late event、audio underrun/drop/clip、PCM/event backpressureをすべて0とし、利用者の同一音量での聴取確認を最終gateにする。
 
 # 非目標
 
@@ -171,6 +181,38 @@ JITは将来候補から除外しないが、実装開始のgateを「FM worker�
 - Chromatic v4へ更新し、KANTAN GB PLAYのFM経路を通常版と`GB_EMBEDDED`版で180 frame比較した。CPU・memory・framebuffer・audio CRCは一致し、`fb=2f1926c0`、`audio=446ea41d`だった。CoreS3計測版は静的RAM 259,436 B（79.2%）、Flash 653,117 B（10.0%）。
 - 同期ymfm実機版は約31 fps、frame約30.4 ms、APU約12.7 ms、audio drop増加だった。Core 0非同期worker版は約40 fps、frame約24.0 msへ改善し、30秒ログで`audio_underruns=0`、`audio_dropped=0`、PCM/event backpressureとも0を確認した。一方、目標59 fpsには未達である。
 - ymfm `generate`のIRAM配置は`.iram0.text`が64,771 Bとなり、起動ログが出ない状態になったため即時撤回した。I-cache lockとinactive channel clock省略は起動したが約40 fpsから有意に改善せず、ROM API依存と互換性リスクを残すため撤回した。これらは失敗した最適化として再採用しない。
+- 8,192 sampleのPSG入力ringを4,096 sampleへ減らし、7,757 Bの`CPU::step()`だけをIRAMへ配置する逆方向のcache競合回避もビルドとhost FM CRCに成功した。しかし実機は書き込み後とreset後のどちらもUSB CDCログ0 byteで起動継続を確認できなかったため即時撤回した。CPU/PPUの大型関数を直接IRAM化する案も再採用しない。
+- CoreS3のymfm翻訳単位だけをO3からO2へ変える実験では、object textが18,505 Bから14,739 Bへ約20%減りFM CRCも不変だった。しかし実機fpsは約40から38.5〜39.0へ悪化したため撤回した。cache footprintよりO3の演算最適化が効いている。
+- プロファイル版全体へ`-flto`を付ける試行は、Arduino-ESP32 2.0.16のリンク手順がGCC LTO pluginをlinkerへ渡さず`plugin needed to handle lto object`と`app_main` undefinedで失敗したため撤回した。toolchain・framework更新なしに同じglobal LTOを再試行しない。
+- Core 1の未計上区間とCore 0 workerのcycleを追加計測した。timer/serial/RTCを含むmiscは約4.5〜4.9 ms/frame、audio workerは約0.67〜0.69 s/s稼働だった。命令ごとのcycle計測自体がfpsを約40から38.5へ下げたためmisc計測は撤回し、低頻度のworker稼働率だけ残した。
+- `output_4op`をCoreS3で強制inline化するAOT特化は、独立関数を消し`ym2151::generate`との合計を約2.57 KiBから1.33 KiBへ減らしFM CRCも不変だった。しかし実機は37.7〜38.2 fpsへ悪化したため撤回した。呼出し削減より大型関数化のI-cache局所性悪化が大きい。
+- Game Boy timerの2の累乗除算を明示的なvariable shiftへ書き換えたが、CoreS3バイナリサイズと実機fpsは変わらなかった。GCC O3が元の2の累乗除算を既にshift化していたためで、意図が直接表現されるshift実装は維持した。
+- YM3012 DACの10.3-bit量子化round-tripを省く実験は、実機fpsを約40.0から40.7へ、worker稼働を約0.67〜0.69 s/sから約0.64 s/sへ小幅改善した。一方で音色精度を落とし、FM event backpressureが0から最大67,666へ増えたため撤回した。精度を落とすfast FM profileとしても採用しない。
+- 正確なYM3012処理へ戻した最終実機15秒計測は39.92〜40.20 fps、worker稼働0.687〜0.717 s/sで、audio underrun/dropとPCM/event backpressureはすべて0だった。Core 0のymfmだけで実時間の約70%を使うため、59.7 fps達成にはFM生成の5〜10%以上の削減に加え、Core 1側の約4.5〜4.9 ms/frameのmisc処理削減が必要である。
+- `GB_PROFILE`なしの正確なFM autoplayを同じ実機で15秒計測すると、外れ値43.00 fpsを除き44.42〜45.91 fps、frame 20.78〜21.49 ms、resample source rate 31.8〜33.8 kHzだった。audio underrun/dropとPCM/event backpressureはすべて0である。命令単位cycle計測の摂動が約5 fpsあるため、40 fpsを本番性能として扱わず、以後の性能acceptanceは非計測版の同一シナリオで比較する。
+- ymfmのsin/power各512 Bとenvelope increment 256 Bをinternal DRAMへ固定するA/Bでは、map上の`.dram1`配置とFM CRC不変を確認したが、RAMが1,288 B増えた一方で実機は外れ値42.96 fpsを除き44.47〜45.86 fpsとbaselineから改善しなかったため撤回した。sin表は初期化時だけ、power表はoperator出力、increment表はenvelope更新時に参照され、64 KiB data cacheで既に十分cacheされる規模だったと推定する。
+- HALT deadline fast-forwardの初回実機15秒計測では、frame処理が約20.8〜21.5 msから10.4〜11.9 msへ短縮し、概ね58〜62 fpsへ達した。KANTAN FMはCPU stepの92.36%、emulated cycleの83.77%がHALT待機だったため、PPU次境界・TIMA overflow・serial完了まで既存`tick()`をまとめる効果が大きかった。一方、60 fpsのFM register burstで512件event queueが満杯になり、backpressure spinが最大366,552まで増えた。
+- inline配列のままFM event queueを1,024件へ拡大する候補は、Core 1側queueだけでなくCore 0 worker stack上の非deferred rendererも4,096 B増やし、実機がUSB再列挙を繰り返したため撤回した。いったん512件へ戻し、実測backlog時の既定fallbackどおりspeaker priority 4、FM worker 3、Grove input 2でdrain性能を比較した。
+- worker priority 3 / Grove priority 2だけの20秒比較でも512件queueは複数回満杯となり、backpressure spinは2,347,773まで累積した。平均44.1 kHz生成とaudio ringは追従しているため、原因はworker優先度ではなくregister write burst容量である。`ChromaticFM`のevent配列をdeferred時だけ動的確保する形へ分離し、非deferred worker rendererのtask stackを増やさずproducerだけ1,024件へする方針へ訂正した。
+- deferred producerだけ1,024件のevent queueをheap確保する実装を実機で60秒連続計測した。59 samplesで57.54〜61.63 fps、frame処理9.245〜13.957 ms、audio ring 2,277〜4,402 samples、event high-water最大412/1,023だった。audio underrun/drop、PCM/event backpressureは全期間0、free heapは102,384 Bで不変だった。これによりHALT fast-forward後のFM register burstを余裕を持って吸収し、正確なYM3012処理のまま実時間再生を維持できることを確認した。
+- 最終autoplay firmwareをCoreS3へ再書き込みし、hash検証後の15秒ログでも58.19〜61.26 fps、event high-water最大428/1,023、free heap 102,384 Bを確認した。audio underrun/dropとPCM/event backpressureはすべて0で、再書き込み後もFM自動演奏を継続した。
+- 利用者から残るプツプツ音の報告を受け、出力直前clip、M5Unified virtual speaker queue空遷移、`playRaw`失敗、chunk境界最大差を追加観測した。20秒ログではclipと`playRaw`失敗は0、境界最大差3,793/65,535、queue空遷移は起動後1秒未満の4回だけで以後増えなかった。従来の`audio_underruns`は1秒時点のsource ringだけを見ており、短いspeaker側状態を保証していなかったため診断項目を訂正した。
+- 無音2 chunkを即時投入する起動処理を撤回し、実音2 chunkぶんをmix ringへ蓄積してから最初のchunkをfade-inする方式へ変更した。virtual queue空遷移は4回から1回へ減った。2 chunkを同一worker周回で連続`playRaw`する候補は書き込み後にUSB CDCログが停止し、実行継続を確認できなかったため撤回した。
+- M5Unified 0.2.15のspeaker taskを確認すると、virtual queueが空でも既定256 samples×8 DMA bufferをゼロで補いながら約46 ms再投入を待つため、`isPlaying()==0`は即時のI2S underrunではない。chunkとmix ringは512/2,048 samplesへ戻し、実際のI2S DMAを512 samples×8の約93 msへ拡張した。最終20秒ログは57.90〜61.57 fps、free heap 97,248 B一定、clip、drop、`playRaw`失敗、PCM/FM backpressureすべて0で、virtual queue空遷移も累積1から増えなかった。主観的なプツプツ消失は利用者の聴取待ちである。
+- 利用者の音程不安定報告とログを照合すると、wall frame時間とring深さから算出したresampler source rateが約43.4〜44.7 kHzの範囲で動き、短期fps jitterをFMの音程へ変換していた。適応rate制御を削除してemulated cycle基準の44,100 Hzへ固定した。実機60秒・59 samplesでは平均59.728 fps、source rate最小/最大とも44,100 Hz、ring 1,639〜4,120 samples、free heap 97,296 B一定で、underrun、drop、clip、`playRaw`失敗、PCM/FM backpressureはすべて0だった。ringは先頭2,587、末尾3,665で周期的に上下し、一方向の枯渇・蓄積は観測しなかった。
+- KANTANのドラム不足報告を受け、Core 0 rendererのADPCM FIFO受理/拒否、再生開始、active sample、ADPCM/YM個別peakを1秒窓で観測した。基準20秒ではFIFO拒否0、毎秒2〜3回のADPCM開始、ADPCM peak 10,014、YM peak 2,895〜3,223で、転送欠落ではなかった。本家通常パターンはキックとYMハイハットが中心で、スネア/クラッシュは8小節ごとのfillだけである。CoreS3のADPCM mix gainを0.5から0.75へ上げ、高頻度診断atomicを128 sample単位へまとめた候補の20秒ログでは57.54〜61.94 fps、FIFO拒否、audio underrun/drop/clip、speaker failure、PCM/FM backpressureがすべて0だった。主観的なドラムバランスは利用者の聴取確認待ちである。
+- 自動演奏のコード変更をwall clockの2,000 ms周期で行うと、KANTAN内部の155 BPM・12 frame/eighth・96 frame/bar（実測約1.6秒）と一致せず、ドラムに対して継続的に位相がずれてリズムが崩れた。`PPU::frameCount`を基準にC–G–Am–Fを各96 emulated frameで切り替え、末尾12 frameだけAを離して次の入力edgeを作る方式へ変更した。CoreS3へ書き込み後の12秒ログでは57.09〜62.01 fps、ADPCM FIFO拒否、audio underrun/drop/clip、speaker failure、PCM/FM backpressureはすべて0であり、累積ドリフトを排除できた。主観的なグルーヴは利用者の聴取確認待ちである。
+- 上記96 frame/barの推定は誤りだった。deferred Chromatic eventをホストでsample位置付き追跡すると、旧autoplayのコード発音間隔は約71,000 samplesだが、ROMのADPCMキック間隔は通常約18,459 samplesで、小節相当は約73,800〜74,600 samplesだった。さらに入力edgeからYM chord key-onまで約1,100〜2,000 samplesの遅延がある。autoplayを44.1 kHz emulated sample cursor基準の74,200 samples/chordへ訂正し、発音間隔73,827〜74,599 samplesとROMのグリッドが一致することを900 frameのhost traceで確認した。CoreS3へhash検証付きで再書き込みした15秒ログは56.49〜63.00 fps、source/playback rate 44,100 Hz、ADPCM FIFO拒否、audio underrun/drop/clip、speaker failure、PCM/FM backpressureがすべて0だった。主観的な位相一致は利用者の聴取確認待ちである。
+- 上記の外部autoplay調整は、固定コミットのROMソース確認により設計ごと撤回した。ROMには`SELECT+A`で開始するデモがあり、コード、ベース、YM noiseハイハット、MSM6258キック/スネア/クラッシュを同じfree-running eighth-note gridで更新する。フロントエンドはframe 206〜209だけ`SELECT+A`を入力し、それ以後は方向・A/Bを一切自動入力しない。900 frameのevent traceではYM chord key-onから次のADPCM startまで約585 samplesで一定となり、累積ドリフトを観測しなかった。
+- 同期Chromatic rendererとCoreS3用deferred producerのKANTAN内蔵デモを3,500 frame実行し、2,589,979 samples、160,240 eventsについてoffline replayとstereo float PCMを比較した。eventはtimestampと同じsampleを生成する直前に適用し、`max_diff=0`、late event 0だった。したがって非同期worker分割はYMとADPCMのsample位置を変えない。
+- ROM内デモはfillで従来計測より大きなregister/FIFO burstを生成した。deferred producerだけのevent queueを2,048件へ拡大した実機35秒計測ではhigh-water 1,368/2,047、event backpressure 0、ADPCM FIFO rejected 0、audio underrun/drop/clip 0、speaker queue failure 0、source/playback rate 44,100 Hzだった。frame 1,609の窓でPSG入力ringへのbackpressure spinが18,840回発生したがsampleのdropやtimestamp変更はなく、その次の窓までにringをdrainした。これは音声欠落ではなくproducerを一時待機させるbounded flow controlとして記録し、主観的な位相一致は利用者の聴取確認待ちとする。
+- 固定ROMソースと900 frame traceを突き合わせると、残る一定offsetはCoreS3のDMAではなくKANTANのADPCM投入順序だった。代表区間はYM chord CH0/CH1/CH2 key-onがsample 196,472/196,536/196,600、ADPCM playが197,057で、CH2後にも457 samples（約10.4 ms）、CH0後には585 samples（約13.3 ms）遅れる。`adpcm_play()`がgrid到達後に160 byteを同期投入してからplay edgeを出すためである。ROMのsmall-prime化は1/8/16 byteすべてFIFO starvationを起こしたため採用せず、固定ROMのSHA-256を維持する方針へ訂正した。
+- 当初1,024 sample lookaheadで音響alignerを固定ROMの内蔵デモ3,500 frameへ適用した。生event replayは2,589,979 samples、160,240 eventsで同期rendererと`max_diff=0`、late event 0を維持した。補正後は137 one-shot、alignment failure 0、FIFO starvation 0で、CH2→ADPCM最大10 samples、ADPCM→YM noiseハイハット最大11 samples、ADPCM→ベース最大74 samplesだった。生eventのCH2→PLAYは445〜458 samplesのままであり、CPU-visible時系列を変えていない。その後、連打の拍補正に必要な先読みを含めるため2,048 samplesへ拡張した。
+- 利用者の「連続したドラム音に弱い」という報告から、整列後のSTOP→PLAY間隔を追加計測した。旧実装は次のSTOPへ前回one-shotの補正量を適用し、最大451 samples（約10.2 ms）の無音を再トリガー直前へ作っていた。STOP、受理済みpreload、PLAYを新トランザクションの同一sampleへ配置するよう訂正し、3,500 frameの136組で有効STOP→PLAY間隔をすべて0 sampleにした。24 samples（約0.54 ms）のhalf-cosine residual de-clickはADPCMのraw predictor/outputと提示波形を分離し、新しいattackをfade-inせず直前波形の残差だけを減衰させる。再トリガー境界の最大段差は0 LSB、CH2→ADPCM最大9 samples、ADPCM→YM noiseハイハット最大11 samples、ベース最大74 samples、FIFO starvation/alignment failureは0だった。2,589,979 samples、160,240 eventsの同期比較は`max_diff=0`、`raw_pcm_hash=98f3333d`、`raw_adpcm_hash=eaadee88`で、YM2151の完全版と最適化版も一致した。CoreS3への最新版書き込み、10分実機連続ログ、利用者の聴取確認はまだ必要である。
+- 上記修正後も利用者の聴取ではリズム不良が残った。固定ROMとbusy有無のA/Bを含む生event traceを再調査し、通常打音の正規化開始間隔が18,426〜20,306 samples（幅1,880、約42.6 ms）であること、同期・deferred実行のCPU/memory/framebuffer/audio CRCが一致することから、DMA、JIT、YM busyではなくROMのmain-loop内処理量に由来する発音jitterと判定した。ROMと生event timestampは維持し、最初の4区間で周期を学習するbounded PLLを自動演奏時の音響consumerだけへ追加した。2,048 sample lookahead、最大1,536 sample補正、周期EWMA 1/64、位相追従1/16で、3,500 frameの補正後間隔は18,779〜19,066 samples（幅287、約6.5 ms）となった。137 one-shot、FIFO starvation/alignment failure 0、STOP→PLAY 0 sample、CH2/ハイハット/ベースoffset最大147/11/74 samples、raw PCM/ADPCM hash不変、YM2151完全版とのbit一致を確認した。非計測autoplayをCoreS3へhash検証付きで書き込み済みだが、利用者の再聴取と10分実機連続ログは未完了である。
+- bounded PLL版に対し、利用者からfillの「タン・タタ」の後半に無理があるとの指摘を受けた。ADPCM開始だけを補正し、その間を刻むYM CH7 noiseハイハットを生時刻に残していたため、ADPCM間隔だけの検証では見えない細分pulseの伸縮が生じていた。ADPCMと64 samples以内のCH7 key-onを同一打音にcluster化し、それ以外を含む全パーカッション間隔を3,500 frameで測定すると、旧補正は3,200〜6,878 samples（幅3,678、約83.4 ms）だった。CH7のkey-on、key-off、noise/operator設定をADPCM streaming feedと同じ音響shiftへ載せる候補は4,322〜5,371 samples（幅1,049、約23.8 ms）で、生eventの幅1,213 samplesも下回った。raw PCM/ADPCM hash、YM2151完全版とのbit一致、FIFO starvation/alignment failure 0を維持し、非計測autoplayをCoreS3へhash検証付きで書き込んだ。新候補の利用者聴取と10分実機連続ログは未完了である。
+- 固定KANTAN ROMの`tools/adpcm.py`は時間順の2 codeを`first | (second << 4)`でpackし、ROM側`adpcm_feed()`は`uint8_t`配列を1 byteずつFIFOへ転送する。現行decoderも`nibbleHi=false`から下位4 bitを先に復号してから上位4 bitへ進む。MAMEのMSM6258参照実装もshift 0から4へ進むため、`0xAB`の時間順は`B → A`で一致する。16 bit以上の値をbyte列へ再解釈する経路はなく、CPUのエンディアンはこの転送へ影響しない。一方、既存の同期/deferred parityは同じdecoder同士の比較なので、ニブル順を独立に保証する既知ベクトルは今後追加する。
+- 2026-08-25に`just test-chromatic-audio 3500`を再実行し、2,589,979 samples・160,240 eventsで`max_diff=0`、late event/FIFO starvation/alignment failure 0、補正後CH2→ADPCM最大9 samples、ADPCM→hat最大11 samples、ADPCM→bass最大74 samples、STOP→PLAY最大0 sample、再トリガー段差最大0 LSBを確認した。補正後パーカッション間隔は4,629〜4,902 samples（幅273）だった。続けて`just --fmt --check`、`just check`、CoreS3通常版`just build`を通し、firmwareは静的RAM 255,308 B（77.9%）、Flash 655,861 B（10.0%）だった。実機の再聴取と10分連続ログは未完了である。
 
 [^local-gb-core]: 現行 `core/` の 2026-08-24 時点のソース調査。
 [^nes-stackchan-port]: NES 移植例の `core/`、`m5stack/`、ホスト比較 harness、性能関連コミットの調査。

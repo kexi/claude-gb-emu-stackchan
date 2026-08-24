@@ -70,6 +70,14 @@ void PPU::checkStatIrq() {
     statLine = line;
 }
 
+int PPU::dotsUntilNextEvent() const {
+    if (!(lcdc & 0x80)) return 0x3FFFFFFF;
+    if (dot == 0) return 1;
+    if (dot < 81) return 81 - dot;
+    if (dot < 253) return 253 - dot;
+    return 456 - dot;
+}
+
 void PPU::tick(int dots) {
     if (!(lcdc & 0x80)) { // LCD off
         ly = 0; dot = 0; stat = (stat & ~3);

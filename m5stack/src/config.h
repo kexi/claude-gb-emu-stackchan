@@ -21,23 +21,29 @@ static_assert(DISPLAY_WIDTH * DISPLAY_BAND_ROWS * 2 < 32768, "one display band m
 constexpr uint32_t AUDIO_SAMPLE_RATE = 44100;
 constexpr uint8_t SPEAKER_VOLUME = 192;
 constexpr uint8_t SPEAKER_CHANNEL = 1;
+constexpr uint8_t SPEAKER_TASK_PRIORITY = 4;
+constexpr uint8_t AUDIO_WORKER_TASK_PRIORITY = 3;
+constexpr uint8_t GROVE_TASK_PRIORITY = 2;
+constexpr float ADPCM_MIX_GAIN = 0.75f;
+constexpr size_t SPEAKER_DMA_BUFFER_SAMPLES = 512;
+constexpr size_t SPEAKER_DMA_BUFFER_COUNT = 8;
 constexpr int AUDIO_RING_SAMPLES = 8192;
 constexpr int AUDIO_RING_MASK = AUDIO_RING_SAMPLES - 1;
 constexpr int AUDIO_CHUNK_SAMPLES = 512;
 constexpr int AUDIO_CHUNK_SLOTS = 4;
 constexpr int AUDIO_MIX_RING_SAMPLES = 2048;
 constexpr int AUDIO_MIX_RING_MASK = AUDIO_MIX_RING_SAMPLES - 1;
-constexpr int AUDIO_RING_TARGET = AUDIO_RING_SAMPLES / 2;
-constexpr float AUDIO_RATE_EWMA_ALPHA = 0.03f;
-constexpr int AUDIO_RATE_WARMUP_FRAMES = 120;
-constexpr float AUDIO_RATE_FEEDBACK_GAIN = 0.1f;
-constexpr float AUDIO_RATE_FEEDBACK_MAX = 0.02f;
-constexpr float AUDIO_RATE_SLEW_MAX = 0.0025f;
-constexpr uint32_t AUDIO_RATE_MIN = 4000;
-constexpr uint32_t AUDIO_RATE_MAX = 48000;
+constexpr uint32_t AUDIO_ALIGNMENT_LOOKAHEAD_SAMPLES = 2048;
+constexpr uint32_t AUDIO_WORKER_IDLE_INTERVAL_SAMPLES = 4096;
 constexpr uint32_t AUDIO_RESAMPLE_ONE = 1U << 16;
 static_assert((AUDIO_RING_SAMPLES & AUDIO_RING_MASK) == 0, "audio ring size must be a power of two");
 static_assert((AUDIO_MIX_RING_SAMPLES & AUDIO_MIX_RING_MASK) == 0, "mix ring size must be a power of two");
+static_assert(AUDIO_ALIGNMENT_LOOKAHEAD_SAMPLES < AUDIO_RING_SAMPLES,
+              "alignment lookahead must fit in the producer PCM ring");
+static_assert(SPEAKER_DMA_BUFFER_SAMPLES <= 1024, "M5Unified limits one speaker DMA buffer to 1024 samples");
+static_assert(SPEAKER_TASK_PRIORITY > AUDIO_WORKER_TASK_PRIORITY, "speaker DMA feeding must preempt FM rendering");
+static_assert(AUDIO_WORKER_TASK_PRIORITY > GROVE_TASK_PRIORITY,
+              "FM rendering must drain register bursts before polling Grove input");
 
 constexpr char SD_ROMS_DIR[] = "/roms";
 constexpr uint32_t SD_SPI_HZ = 25000000;

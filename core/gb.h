@@ -1,5 +1,6 @@
 // Game Boy / Game Boy Color emulator core
 #pragma once
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <new>
@@ -121,6 +122,7 @@ struct PPU {
 
     void reset(bool cgb);
     void tick(int dots);           // advance by PPU dots (4.19MHz)
+    int dotsUntilNextEvent() const;
     void renderScanline();
     void checkStatIrq();
     Pixel cgbColor(const uint8_t* pal, int palIdx, int colorIdx) const;
@@ -158,7 +160,7 @@ struct APU {
     uint16_t ch4Lfsr = 0x7FFF;
 
     void reset();
-    void setSampleRate(double r) { sampleRate = (uint32_t)(r + 0.5); }
+    void setSampleRate(double r) { sampleRate = static_cast<uint32_t>(std::lround(r)); }
     uint8_t read(uint8_t reg) const;
     void write(uint8_t reg, uint8_t v);
     void tick(int cycles);         // 4.19MHz cycles
@@ -224,6 +226,8 @@ struct GB {
 
 #ifdef GB_EMBEDDED
     int apuPendingCycles = 0;
+    uint32_t haltFastForwardCount = 0;
+    uint32_t haltFastForwardCycles = 0;
 #endif
 
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
@@ -246,6 +250,7 @@ struct GB {
     void tick(int cpuCycles);      // advance peripherals by CPU T-cycles
 #ifdef GB_EMBEDDED
     void flushApu();
+    int haltDeadlineCycles(int budget) const;
 #endif
     void tickTimer(int cpuCycles);
     void doOamDma(uint8_t page);

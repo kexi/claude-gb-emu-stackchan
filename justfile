@@ -35,6 +35,7 @@ clean confirm='':
 
 # 新規 CoreS3 / host harness と Nix ファイルを整形する
 fmt:
+    clang-format -i core/chromatic.cpp core/chromatic.h
     rg --files m5stack/src tools -g '*.cpp' -g '*.h' | xargs clang-format -i
     ruff format tools/capture_serial.py
     nixfmt flake.nix
@@ -42,6 +43,7 @@ fmt:
 
 # 新規 CoreS3 / host harness、Nix、justfile の整形を検査する
 fmt-check:
+    clang-format --dry-run --Werror core/chromatic.cpp core/chromatic.h
     rg --files m5stack/src tools -g '*.cpp' -g '*.h' | xargs clang-format --dry-run --Werror
     ruff format --check tools/capture_serial.py
     ruff check tools/capture_serial.py
@@ -58,7 +60,7 @@ clang-tidy:
     #!/bin/bash
     set -euo pipefail
     cmake -S . -B .stackchan/cmake -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "-DCMAKE_CXX_FLAGS=${NIX_CFLAGS_COMPILE:-}" "-DCMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES=${GB_CLANG_CXX_INCLUDE:?run inside nix develop};${GB_CLANG_RESOURCE_INCLUDE:?run inside nix develop}"
-    clang-tidy -p .stackchan/cmake core/apu.cpp core/cartridge.cpp core/chromatic.cpp core/cpu.cpp core/gb.cpp core/ppu.cpp tools/verify_host.cpp
+    clang-tidy -p .stackchan/cmake core/apu.cpp core/cartridge.cpp core/chromatic.cpp core/cpu.cpp core/gb.cpp core/ppu.cpp tools/verify_host.cpp tools/verify_chromatic_audio.cpp
 
 # 参照版と組込み高速化版を決定的に比較する
 test frames='180':
@@ -104,6 +106,38 @@ test-rom-fm frames='180': rom
     "$work_dir/embedded" "{{ frames }}" m5stack/data/kantan-gb-play.gbc --fm > "$work_dir/embedded.txt"
     diff -u "$work_dir/ref.txt" "$work_dir/embedded.txt"
     cat "$work_dir/ref.txt"
+
+# KANTAN内蔵デモの生イベント一致とCoreS3音響整列をsample単位で検証する
+test-chromatic-audio frames='3500' maximum_chord_play_offset='-1': rom
+    #!/bin/bash
+    set -euo pipefail
+    work_dir=$(mktemp -d)
+    trap 'rm -rf "$work_dir"' EXIT
+    clang++ -std=c++17 -O2 -DGB_EMBEDDED -o "$work_dir/verify-audio" tools/verify_chromatic_audio.cpp core/*.cpp core/ymfm/ymfm_opm.cpp
+    "$work_dir/verify-audio" m5stack/data/kantan-gb-play.gbc "{{ frames }}" "{{ maximum_chord_play_offset }}"
+
+# YM2151高速化版のPCMを全チャンネル更新の参照版とbit単位で比較する
+test-ym2151-optimization frames='900' maximum_chord_play_offset='64': rom
+    #!/bin/bash
+    set -euo pipefail
+    work_dir=$(mktemp -d)
+    trap 'rm -rf "$work_dir"' EXIT
+    sources=(tools/verify_chromatic_audio.cpp core/*.cpp core/ymfm/ymfm_opm.cpp)
+    clang++ -std=c++17 -O2 -DGB_EMBEDDED -DYMFM_PARTIAL_CACHE_INVALIDATION=0 -DYMFM_SKIP_INACTIVE_CHANNEL_CLOCKS=0 -o "$work_dir/reference" "${sources[@]}"
+    clang++ -std=c++17 -O2 -DGB_EMBEDDED -o "$work_dir/optimized" "${sources[@]}"
+    "$work_dir/reference" m5stack/data/kantan-gb-play.gbc "{{ frames }}" "{{ maximum_chord_play_offset }}" > "$work_dir/reference.txt"
+    "$work_dir/optimized" m5stack/data/kantan-gb-play.gbc "{{ frames }}" "{{ maximum_chord_play_offset }}" > "$work_dir/optimized.txt"
+    diff -u "$work_dir/reference.txt" "$work_dir/optimized.txt"
+    cat "$work_dir/optimized.txt"
+
+# KANTAN GBのADPCM開始とYM2151キーオンをsample位置付きで記録する
+trace-rhythm frames='700': rom
+    #!/bin/bash
+    set -euo pipefail
+    work_dir=$(mktemp -d)
+    trap 'rm -rf "$work_dir"' EXIT
+    clang++ -std=c++17 -O2 -DGB_EMBEDDED -o "$work_dir/trace" tools/verify_host.cpp core/*.cpp core/ymfm/ymfm_opm.cpp
+    "$work_dir/trace" "{{ frames }}" m5stack/data/kantan-gb-play.gbc --fm --trace-rhythm
 
 # WebAssembly 版をビルドする
 build-web:
@@ -238,6 +272,8 @@ ci:
     just fmt-check
     just check
     just test-rom
+    just test-chromatic-audio 900 64
+    just test-ym2151-optimization 900 64
     just clang-tidy
     just build-web
     just build
