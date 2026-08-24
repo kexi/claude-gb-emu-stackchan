@@ -215,6 +215,7 @@ KANTANの自動演奏はフロントエンド側でコード進行を生成し�
 - 2026-08-25に`just test-chromatic-audio 3500`を再実行し、2,589,979 samples・160,240 eventsで`max_diff=0`、late event/FIFO starvation/alignment failure 0、補正後CH2→ADPCM最大9 samples、ADPCM→hat最大11 samples、ADPCM→bass最大74 samples、STOP→PLAY最大0 sample、再トリガー段差最大0 LSBを確認した。補正後パーカッション間隔は4,629〜4,902 samples（幅273）だった。続けて`just --fmt --check`、`just check`、CoreS3通常版`just build`を通し、firmwareは静的RAM 255,308 B（77.9%）、Flash 655,861 B（10.0%）だった。実機の再聴取と10分連続ログは未完了である。
 - main push後のGitHub Actions run `32742629269`では`nix flake check`と音響検証まで通ったが、Linuxの`clang-tidy`が通常Clangのlibstdc++探索と明示したlibc++ headerを混在させ、標準`math.h`で160 errorsとなった。さらにhost検証の配列長計算が`bugprone-sizeof-expression`に違反した。devShellのcompilerを`llvmPackages.libcxxClang`へ統一し、配列長を`std::size`へ変更した候補で、macOS上の`just fmt-check`、`nix flake check`、`nix develop --command just clang-tidy`が成功した。Linux CIでの再検証は修正push後に行う。
 - 修正run `32743108266`でもLinux clang-tidyはホストGCCの既定C++ headerを追加し、libc++との混在が残った。Nixのcompiler package変更だけではcompile databaseをclang-tidyが再解釈する際の既定探索を制御できないため、CMake生成時のcompile flagsへ`-nostdinc++`を追加し、`GB_CLANG_CXX_INCLUDE`で明示したlibc++だけを使わせる方針へ訂正した。この候補はmacOS Nix devShellで8 translation unitsのclang-tidyを通過した。Linux CIでの再検証は再push後に行う。
+- mainへ再pushしたGitHub Actions run `32743523810`は4分55秒で成功した。Linux上の`nix flake check`と`nix develop --command just ci`がともに通過し、`-nostdinc++`によるlibc++ header分離が実CIでも有効であること、およびADPCM修正を含むmainの全CI検証が完了したことを確認した。
 
 [^local-gb-core]: 現行 `core/` の 2026-08-24 時点のソース調査。
 [^nes-stackchan-port]: NES 移植例の `core/`、`m5stack/`、ホスト比較 harness、性能関連コミットの調査。
