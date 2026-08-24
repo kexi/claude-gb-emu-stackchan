@@ -59,7 +59,7 @@ lint:
 clang-tidy:
     #!/bin/bash
     set -euo pipefail
-    cmake -S . -B .stackchan/cmake -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "-DCMAKE_CXX_FLAGS=${NIX_CFLAGS_COMPILE:-}" "-DCMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES=${GB_CLANG_CXX_INCLUDE:?run inside nix develop};${GB_CLANG_RESOURCE_INCLUDE:?run inside nix develop}"
+    cmake -S . -B .stackchan/cmake -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "-DCMAKE_CXX_FLAGS=${NIX_CFLAGS_COMPILE:-} -nostdinc++" "-DCMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES=${GB_CLANG_CXX_INCLUDE:?run inside nix develop};${GB_CLANG_RESOURCE_INCLUDE:?run inside nix develop}"
     clang-tidy -p .stackchan/cmake core/apu.cpp core/cartridge.cpp core/chromatic.cpp core/cpu.cpp core/gb.cpp core/ppu.cpp tools/verify_host.cpp tools/verify_chromatic_audio.cpp
 
 # 参照版と組込み高速化版を決定的に比較する
