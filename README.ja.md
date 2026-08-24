@@ -1,4 +1,4 @@
-# claude-gb-emu
+# claude-gb-emu-stackchan
 
 ブラウザと M5Stack CoreS3（ESP32-S3）で動く Game Boy / Game Boy Color エミュレータ。共有コアは C++ で、Web 版は Emscripten で WebAssembly にコンパイルします。
 
@@ -7,6 +7,17 @@
 「ROMを開く」から .gb / .gbc ファイルを開くか、画面にドロップしてください。「URL」ボタンで ROM の URL を直接指定することもできます(`?rom=<URL>` パラメータにも対応、CORS 許可が必要)。
 
 🌐 [English](README.md)
+
+## このフォークで追加したもの
+
+これはブラウザ向けの [GOROman/claude-gb-emu](https://github.com/GOROman/claude-gb-emu) のフォークです。Web 版はそのまま動く状態を保ちつつ、同じコアを使った **M5Stack CoreS3 / Stack-chan 単体動作版**と、両方の正しさを保つための道具立てを追加しています。
+
+- **CoreS3 ファームウェア**（`m5stack/`）— 実機上でエミュレータを動かします。LCD への 240×216 バンド DMA、内蔵スピーカーでの音声、microSD からの ROM 選択、`.sav` へのバッテリー SRAM 保存、Grove Joystick / Dual Button 入力に対応します。電源投入時は microSD なしで、ファームウェア内蔵の [KANTAN GB PLAY](https://github.com/GOROman/kantan-gb-play) を直接起動します。
+- **共有コアの組込み向け高速化** — すべて `GB_EMBEDDED` の内側にあるため、ブラウザ版の出力は 1 バイトも変わりません。HALT 期限までの fast-forward、CGB パレットキャッシュ付きの PPU タイルラン描画、APU サンプルの整数化、LCD へ送らないフレームのピクセル生成省略などで、実機を約 9 fps から約 59.7 fps へ引き上げています。
+- **実機での FM 音声の非同期化** — Core 1 がエミュレーションを行い、Core 0 が ymfm、ADPCM 復号、ミックス、リサンプル、I2S 投入を所有します。両者は PCM リングと時刻付き FM イベントリングだけを共有します。さらに音響アライナが ROM 側の `STOP → preload → PLAY` という ADPCM 投入順序を補正し、ドラムを拍に合わせます。
+- **決定的な検証ハーネス**（`tools/`）— 同じ ROM を参照版と `GB_EMBEDDED` 版へ流し、CPU、WRAM、VRAM、OAM、framebuffer、音声の CRC が完全一致することを要求します。組込み向け最適化が出力を静かに変えることを防ぎます。
+- **再現可能な環境と CI** — `flake.nix` によるツールの固定、`justfile` のコマンド面、lefthook の pre-commit hook、GitHub Actions での全検査。詳細は [CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) を参照してください。
+- **`knowledge/`** — 設計判断と計測記録。試したうえで撤回した最適化も、理由となる数値とともに残しています。
 
 ## Features
 

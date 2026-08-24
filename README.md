@@ -1,4 +1,4 @@
-# claude-gb-emu
+# claude-gb-emu-stackchan
 
 A Game Boy / Game Boy Color emulator for browsers and the ESP32-S3-based M5Stack CoreS3. Its shared core is written in C++; the web build compiles it to WebAssembly with Emscripten.
 
@@ -7,6 +7,17 @@ A Game Boy / Game Boy Color emulator for browsers and the ESP32-S3-based M5Stack
 Open a .gb / .gbc file with "Open ROM" or drop it onto the screen. The "URL" button loads a ROM directly from a URL (also via the `?rom=<URL>` parameter; the host must allow CORS).
 
 🌐 [日本語](README.ja.md)
+
+## What this fork adds
+
+This is a fork of [GOROman/claude-gb-emu](https://github.com/GOROman/claude-gb-emu), which targets the browser. The fork keeps that web build working unchanged and adds a **standalone M5Stack CoreS3 / Stack-chan port** of the same core, plus the tooling needed to keep both targets honest.
+
+- **CoreS3 firmware** (`m5stack/`) — runs the emulator on the device itself: 240×216 banded DMA to the LCD, audio through the built-in speaker, ROM selection from microSD, battery SRAM saved as `.sav`, and Grove Joystick / Dual Button input. Power-on boots a firmware-embedded [KANTAN GB PLAY](https://github.com/GOROman/kantan-gb-play) without a microSD card.
+- **Embedded performance work in the shared core** — behind `GB_EMBEDDED`, so the browser build is byte-for-byte unaffected: HALT deadline fast-forward, PPU tile-run rendering with CGB palette caching, integer APU sample accumulation, and skipping pixel generation on frames that are never sent to the LCD. This is what takes the device from roughly 9 fps to a steady ~59.7 fps.
+- **Asynchronous FM audio on the device** — Core 1 emulates while Core 0 owns ymfm, ADPCM decoding, mixing, resampling, and the I2S queue, communicating over a PCM ring and a timestamped FM event ring. An audio aligner corrects the ROM's `STOP → preload → PLAY` ADPCM ordering so drums land on the beat.
+- **Deterministic verification harness** (`tools/`) — replays a ROM through the reference and `GB_EMBEDDED` builds and requires identical CPU, WRAM, VRAM, OAM, framebuffer, and audio CRCs, so an embedded optimization cannot silently change output.
+- **Reproducible environment and CI** — every tool pinned in `flake.nix`, a `justfile` command surface, lefthook pre-commit hooks, and a GitHub Actions run of the whole check suite. See [CONTRIBUTING.md](CONTRIBUTING.md).
+- **`knowledge/`** — the design decisions and the measurement record, including the optimizations that were tried and withdrawn, with the numbers explaining why.
 
 ## Features
 
