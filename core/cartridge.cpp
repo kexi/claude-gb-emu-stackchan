@@ -6,6 +6,17 @@ namespace gb {
 bool Cartridge::load(const uint8_t* data, size_t size) {
     if (size < 0x8000) return false;
     rom.assign(data, data + size);
+    return configureLoadedRom();
+}
+
+bool Cartridge::load(ByteStorage&& data) {
+    const bool isTooSmall = data.size() < 0x8000;
+    if (isTooSmall) return false;
+    rom = std::move(data);
+    return configureLoadedRom();
+}
+
+bool Cartridge::configureLoadedRom() {
     type = rom[0x147];
     battery = false; hasRtc = false;
     switch (type) {
@@ -34,6 +45,7 @@ bool Cartridge::load(const uint8_t* data, size_t size) {
     if (mbc == 2) ramSize = 512;   // built-in 512x4bit
     ram.assign(ramSize, 0xFF);
     ramBanks = ramSize > 0 ? (ramSize + 8191) / 8192 : 0;
+    ramGeneration = 0;
 
     ramEnable = false; romBank = 1; ramBank = 0; mbc1Mode = 0; mbc1Hi = 0;
     rtcSelect = -1; rtcLatchPrev = 0xFF; rtcAccum = 0;
@@ -130,10 +142,17 @@ void Cartridge::write(uint16_t addr, uint8_t v) {
         return;
     }
     if (ram.empty()) return;
-    if (mbc == 2) { ram[addr & 0x1FF] = v & 0x0F; return; }
+    if (mbc == 2) {
+        ram[addr & 0x1FF] = v & 0x0F;
+        ramGeneration++;
+        return;
+    }
     int bank = (mbc == 1 && mbc1Mode == 0) ? 0 : ramBank;
     size_t off = (size_t)(bank % (ramBanks ? ramBanks : 1)) * 0x2000 + (addr - 0xA000);
-    if (off < ram.size()) ram[off] = v;
+    if (off < ram.size()) {
+        ram[off] = v;
+        ramGeneration++;
+    }
 }
 
 } // namespace gb

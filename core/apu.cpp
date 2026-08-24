@@ -124,10 +124,16 @@ void APU::write(uint8_t reg, uint8_t v) {
 void APU::stepFrameSequencer() {
     // steps 0,2,4,6: length; 2,6: sweep; 7: envelope
     if ((fsStep & 1) == 0) {
-        if ((regs[0x04] & 0x40) && ch1Len > 0 && --ch1Len == 0) ch1On = false;
-        if ((regs[0x09] & 0x40) && ch2Len > 0 && --ch2Len == 0) ch2On = false;
-        if ((regs[0x0E] & 0x40) && ch3Len > 0 && --ch3Len == 0) ch3On = false;
-        if ((regs[0x13] & 0x40) && ch4Len > 0 && --ch4Len == 0) ch4On = false;
+        const auto tickLength = [](bool enabled, int& length, bool& channelOn) {
+            const bool shouldTick = enabled && length > 0;
+            if (!shouldTick) return;
+            length--;
+            if (length == 0) channelOn = false;
+        };
+        tickLength(regs[0x04] & 0x40, ch1Len, ch1On);
+        tickLength(regs[0x09] & 0x40, ch2Len, ch2On);
+        tickLength(regs[0x0E] & 0x40, ch3Len, ch3On);
+        tickLength(regs[0x13] & 0x40, ch4Len, ch4On);
     }
     if (fsStep == 2 || fsStep == 6) { // sweep
         if (ch1SweepOn && ch1On) {

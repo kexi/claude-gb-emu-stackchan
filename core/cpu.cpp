@@ -52,7 +52,11 @@ int CPU::handleInterrupts() {
 }
 
 int CPU::step() {
-    if (imeDelay > 0 && --imeDelay == 0) ime = true;
+    const bool hasPendingImeEnable = imeDelay > 0;
+    if (hasPendingImeEnable) {
+        imeDelay--;
+        if (imeDelay == 0) ime = true;
+    }
 
     int ic = handleInterrupts();
     if (ic) return ic;

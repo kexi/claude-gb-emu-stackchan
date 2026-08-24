@@ -1,5 +1,37 @@
 // Chromatic FM expansion: YM2151 (ymfm) + MSM6258 ADPCM decoder.
 #include "chromatic.h"
+#ifdef GB_EMBEDDED
+
+#include <cstring>
+
+namespace gb {
+
+ChromaticFM::~ChromaticFM() = default;
+
+void ChromaticFM::reset() {
+    ymAddrLatch = 0;
+    audioControl = 0x02;
+    volumeLeft = volumeRight = 0x80;
+    adpcmVolume = 8;
+    memset(fifo, 0, sizeof(fifo));
+    fifoRd = fifoWr = fifoCount = 0;
+    adpcmActive = nibbleHi = false;
+    adpcmSignal = adpcmStep = 0;
+    adpcmAcc = ymAcc = 0;
+    adpcmOut = ymL = ymR = 0;
+}
+
+uint8_t ChromaticFM::read(uint8_t) { return 0xFF; }
+void ChromaticFM::write(uint8_t, uint8_t) {}
+void ChromaticFM::generateSample(double) { ymL = ymR = adpcmOut = 0; }
+void ChromaticFM::adpcmDecodeNibble() {}
+void ChromaticFM::adpcmStart() {}
+void ChromaticFM::adpcmStop() {}
+
+} // namespace gb
+
+#else
+
 #include "ymfm/ymfm_opm.h"
 #include <cstring>
 
@@ -186,3 +218,5 @@ void ChromaticFM::generateSample(double sampleRate) {
 }
 
 } // namespace gb
+
+#endif

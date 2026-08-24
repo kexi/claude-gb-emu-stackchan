@@ -1,16 +1,7 @@
 #!/bin/bash
-# Build the C++ Game Boy Color core to WebAssembly (output: web/gbc.js + web/gbc.wasm)
-set -e
+# Build the C++ Game Boy Color core to WebAssembly (output: web/gbc.js + web/gbc.wasm).
+set -euo pipefail
 cd "$(dirname "$0")"
-
-# Homebrew emscripten needs these on this machine (system python is 3.9, config points at wrong LLVM)
-if [ -x /opt/homebrew/bin/python3.14 ]; then
-  export EMSDK_PYTHON=/opt/homebrew/bin/python3.14
-fi
-if [ -d /opt/homebrew/opt/emscripten/libexec/llvm/bin ]; then
-  export EM_LLVM_ROOT=/opt/homebrew/opt/emscripten/libexec/llvm/bin
-  export EM_BINARYEN_ROOT=/opt/homebrew/opt/emscripten/libexec/binaryen
-fi
 
 emcc -O3 -std=c++17 \
   core/cpu.cpp core/ppu.cpp core/apu.cpp core/cartridge.cpp core/gb.cpp core/chromatic.cpp core/ymfm/ymfm_opm.cpp \
@@ -22,8 +13,9 @@ emcc -O3 -std=c++17 \
   -sENVIRONMENT=web \
   --no-entry
 
-# stamp a fresh version into index.html so browsers never serve stale JS/WASM
+# A backup suffix works with both BSD and GNU sed; remove it after stamping.
 VER=$(date +%s)
-sed -i '' -E "s/(\\?v=|GB_VER=')[0-9a-zA-Z]+/\\1${VER}/g" web/index.html
+sed -i.bak -E "s/(\\?v=|GB_VER=')[0-9a-zA-Z]+/\\1${VER}/g" web/index.html
+rm -f web/index.html.bak
 
 echo "Build OK: web/gbc.js web/gbc.wasm (v=${VER})"

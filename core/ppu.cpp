@@ -4,9 +4,23 @@
 namespace gb {
 
 // DMG shades (slightly warm off-white to dark, easy on the eyes)
-static const uint32_t DMG_SHADES[4] = {
+static const uint32_t DMG_SHADES_RGBA[4] = {
     0xFFD0F8E0, 0xFF70C088, 0xFF566834, 0xFF201808, // ABGR (little-endian RGBA)
 };
+
+static Pixel toPixel(uint32_t rgba) {
+#if defined(GB_EMBEDDED) && defined(ESP_PLATFORM)
+    const uint8_t r = rgba & 0xFF;
+    const uint8_t g = (rgba >> 8) & 0xFF;
+    const uint8_t b = (rgba >> 16) & 0xFF;
+    const uint16_t rgb565 = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+    return (Pixel)__builtin_bswap16(rgb565);
+#else
+    return rgba;
+#endif
+}
+
+static Pixel dmgShades[4];
 
 void PPU::reset(bool cgbMode) {
     (void)cgbMode;
@@ -19,9 +33,10 @@ void PPU::reset(bool cgbMode) {
     memset(bgPal, 0xFF, sizeof(bgPal));
     memset(objPal, 0xFF, sizeof(objPal));
     memset(framebuffer, 0xFF, sizeof(framebuffer));
+    for (int i = 0; i < 4; i++) dmgShades[i] = toPixel(DMG_SHADES_RGBA[i]);
 }
 
-uint32_t PPU::cgbColor(const uint8_t* pal, int palIdx, int colorIdx) const {
+Pixel PPU::cgbColor(const uint8_t* pal, int palIdx, int colorIdx) const {
     int off = palIdx * 8 + colorIdx * 2;
     uint16_t c = pal[off] | (pal[off + 1] << 8);
     int r = c & 0x1F, gr = (c >> 5) & 0x1F, bl = (c >> 10) & 0x1F;
@@ -30,7 +45,7 @@ uint32_t PPU::cgbColor(const uint8_t* pal, int palIdx, int colorIdx) const {
     int G = (gr * 24 + bl * 8) / 32;
     int B = (r * 6 + gr * 4 + bl * 22) / 32;
     R = R * 255 / 31; G = G * 255 / 31; B = B * 255 / 31;
-    return 0xFF000000 | (B << 16) | (G << 8) | R;
+    return toPixel(0xFF000000 | (B << 16) | (G << 8) | R);
 }
 
 void PPU::checkStatIrq() {
@@ -49,8 +64,24 @@ void PPU::tick(int dots) {
         ly = 0; dot = 0; stat = (stat & ~3);
         return;
     }
-    while (dots-- > 0) {
+    while (dots > 0) {
+#ifdef GB_EMBEDDED
+        // CPU-visible writes can only happen between GB::tick calls. Jumping to
+        // the next mode/line boundary therefore preserves every observable PPU
+        // transition while avoiding one loop iteration per 4.19 MHz dot.
+        int nextEvent;
+        if (dot == 0) nextEvent = 1;
+        else if (dot < 81) nextEvent = 81;
+        else if (dot < 253) nextEvent = 253;
+        else nextEvent = 456;
+        int advance = nextEvent - dot;
+        if (advance > dots) advance = dots;
+        dot += advance;
+        dots -= advance;
+#else
         dot++;
+        dots--;
+#endif
         int oldMode = stat & 3;
         int mode;
         if (ly >= 144) mode = 1;
@@ -85,7 +116,7 @@ void PPU::tick(int dots) {
 void PPU::renderScanline() {
     if (ly >= 144) return;
     GB& g = *gb;
-    uint32_t* row = framebuffer + ly * 160;
+    Pixel* row = framebuffer + ly * 160;
     bool cgbMode = g.cgb;
 
     uint8_t bgColorIdx[160];   // 0-3 color index of BG/window pixel
@@ -132,11 +163,11 @@ void PPU::renderScanline() {
             if (cgbMode) {
                 row[x] = cgbColor(bgPal, attr & 7, ci);
             } else {
-                row[x] = DMG_SHADES[(bgp >> (ci * 2)) & 3];
+                row[x] = dmgShades[(bgp >> (ci * 2)) & 3];
             }
         }
     } else {
-        for (int x = 0; x < 160; x++) row[x] = DMG_SHADES[0];
+        for (int x = 0; x < 160; x++) row[x] = dmgShades[0];
     }
     if (windowDrawn) windowLine++;
 
@@ -189,7 +220,7 @@ void PPU::renderScanline() {
                 row[sxp] = cgbColor(objPal, attr & 7, ci);
             } else {
                 uint8_t pal = (attr & 0x10) ? obp1 : obp0;
-                row[sxp] = DMG_SHADES[(pal >> (ci * 2)) & 3];
+                row[sxp] = dmgShades[(pal >> (ci * 2)) & 3];
             }
         }
     }

@@ -1,6 +1,6 @@
 # claude-gb-emu
 
-ブラウザで動く Game Boy / Game Boy Color エミュレータ。コアは C++ で書かれ、Emscripten で WebAssembly にコンパイルされています。
+ブラウザと M5Stack CoreS3（ESP32-S3）で動く Game Boy / Game Boy Color エミュレータ。共有コアは C++ で、Web 版は Emscripten で WebAssembly にコンパイルします。
 
 **▶ Play: https://goroman.github.io/claude-gb-emu/**
 
@@ -26,6 +26,21 @@
 - 左側に操作説明、右側にデバッグパネル(CPU レジスタ・APU レジスタ・メモリダンプ)。DEBUG ボタンか D キーで切り替え
 
 ## Build
+
+### M5Stack CoreS3 / Stack-chan
+
+電源投入すると、ファームウェア内蔵の [KANTAN GB PLAY](https://github.com/GOROman/kantan-gb-play) がSDカードなしで直接起動します。ビルド時に固定コミットからROMを取得してSHA-256を検証し、ROM自体はリポジトリへ含めません。任意の `.gb` / `.gbc` はFAT32 microSDの `/roms` に追加でき、BtnC長押しのメニューから選択できます。
+
+```sh
+direnv allow          # または nix develop
+just check
+just build
+just flash <port> yes # 実機を接続し、既存 firmware を置換する場合だけ
+```
+
+画面、スピーカー、microSD、本体タッチに加え、Grove Joystick / Dual Button を使えます。配線、操作、性能ログは [m5stack/README.md](m5stack/README.md)、設計判断と検証条件は [knowledge/stackchan-port-architecture.md](knowledge/stackchan-port-architecture.md) を参照してください。
+
+### WebAssembly
 
 ```sh
 ./build.sh   # 要 emscripten。web/gbc.js + web/gbc.wasm を生成
@@ -59,6 +74,9 @@ core/apu.cpp       APU
 core/cartridge.cpp MBC / カートリッジ
 core/gb.cpp        バス・タイマー・DMA・WASM API
 web/               フロントエンド (index.html / main.js / audio-worklet.js)
+m5stack/           CoreS3 フロントエンド、PlatformIO 設定
+tools/             参照版と組込み版の決定的比較 harness
+knowledge/         設計判断、性能予算、検証記録
 ```
 
 ## License

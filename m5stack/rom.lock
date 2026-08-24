@@ -1,0 +1,3 @@
+ROM_URL="https://raw.githubusercontent.com/GOROman/kantan-gb-play/9ae7b2d6e3cbdd1fb5904087f976d22b8429bad5/kantan-gb-play.gbc"
+ROM_SHA256="025616ae41b8cffad7d9ab07c5c75263d98c6feae40359b88344492a7053348d"
+ROM_FILE="data/kantan-gb-play.gbc"

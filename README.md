@@ -1,6 +1,6 @@
 # claude-gb-emu
 
-A Game Boy / Game Boy Color emulator that runs in the browser. The core is written in C++ and compiled to WebAssembly with Emscripten.
+A Game Boy / Game Boy Color emulator for browsers and the ESP32-S3-based M5Stack CoreS3. Its shared core is written in C++; the web build compiles it to WebAssembly with Emscripten.
 
 **▶ Play: https://goroman.github.io/claude-gb-emu/**
 
@@ -26,6 +26,21 @@ Open a .gb / .gbc file with "Open ROM" or drop it onto the screen. The "URL" but
 - Controls guide on the left; debug panel (CPU registers, APU registers, memory dump) on the right, toggled with the DEBUG button or the D key
 
 ## Build
+
+### M5Stack CoreS3 / Stack-chan
+
+Power-on boots the firmware-embedded [KANTAN GB PLAY](https://github.com/GOROman/kantan-gb-play) directly without a microSD card. The build fetches the ROM from a pinned commit and verifies its SHA-256 digest; the ROM itself is not committed here. Optional `.gb` / `.gbc` files can be placed in `/roms` on a FAT32 microSD card and selected from the menu by holding BtnC.
+
+```sh
+direnv allow          # or: nix develop
+just check
+just build
+just flash <port> yes # only when a device is connected and its firmware should be replaced
+```
+
+The frontend supports the display, speaker, microSD, built-in touch buttons, Grove Joystick, and Dual Button unit. See [m5stack/README.md](m5stack/README.md) for wiring, controls, and performance logs, and [knowledge/stackchan-port-architecture.md](knowledge/stackchan-port-architecture.md) for design decisions and verification criteria.
+
+### WebAssembly
 
 ```sh
 ./build.sh   # requires emscripten; outputs web/gbc.js + web/gbc.wasm
@@ -59,6 +74,9 @@ core/apu.cpp       APU
 core/cartridge.cpp MBC / cartridge
 core/gb.cpp        bus, timer, DMA, WASM API
 web/               frontend (index.html / main.js / audio-worklet.js)
+m5stack/           CoreS3 frontend and PlatformIO configuration
+tools/             deterministic reference-versus-embedded harness
+knowledge/         architecture, performance budgets, and verification records
 ```
 
 ## License

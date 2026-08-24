@@ -1,0 +1,5 @@
+architecture: システム構造とコンポーネント境界に関する知識
+embedded: 組込み環境固有の制約と実装に関する知識
+emulator: ゲーム機エミュレーションに関する知識
+performance: 計測に基づく性能設計と最適化に関する知識
+stackchan: Stack-chan および M5Stack CoreS3 に関する知識

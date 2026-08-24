@@ -1,3 +1,11 @@
+.direnv/
+result
+m5stack/.pio/
+m5stack/compile_commands.json
+.stackchan/diagnostics/
+.stackchan/cmake/
+*.gb
+*.gbc
+*.sav
+*.sav.part
 .DS_Store
-*.o
-*.ppm

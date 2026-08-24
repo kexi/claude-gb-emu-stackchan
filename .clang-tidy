@@ -1,0 +1,15 @@
+Checks: >
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  -bugprone-branch-clone,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-narrowing-conversions,
+  -bugprone-switch-missing-default-case,
+  -performance-enum-size,
+  -performance-trivially-destructible
+HeaderFilterRegex: '(core|m5stack/src)/.*\.h$'
+WarningsAsErrors: '*'
+FormatStyle: file

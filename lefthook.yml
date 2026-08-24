@@ -1,0 +1,15 @@
+pre-commit:
+  commands:
+    gitleaks:
+      run: just gitleaks-staged
+    workflow:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: just actionlint && just pinact-check
+    justfile:
+      glob: "justfile"
+      run: just justfile-fmt-check
+    clang-format:
+      glob:
+        - "m5stack/src/*.{cpp,h}"
+        - "tools/*.{cpp,h}"
+      run: clang-format --dry-run --Werror {staged_files}

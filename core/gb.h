@@ -2,10 +2,57 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <new>
+#include <utility>
 #include <vector>
+#ifdef ESP_PLATFORM
+#include <esp_heap_caps.h>
+#endif
 #include "chromatic.h"
 
 namespace gb {
+
+// The browser consumes little-endian RGBA words. On CoreS3 the panel consumes
+// big-endian RGB565, so the embedded core stores byte-swapped 565 directly and
+// lets the frontend DMA it without a per-frame colour conversion.
+#if defined(GB_EMBEDDED) && defined(ESP_PLATFORM)
+using Pixel = uint16_t;
+#else
+using Pixel = uint32_t;
+#endif
+
+#ifdef ESP_PLATFORM
+template <typename T>
+struct PsramAllocator {
+    using value_type = T;
+
+    PsramAllocator() = default;
+    template <typename U>
+    PsramAllocator(const PsramAllocator<U>&) {}
+
+    T* allocate(size_t count) {
+        void* storage = heap_caps_malloc(count * sizeof(T), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        const bool allocationFailed = storage == nullptr;
+        if (allocationFailed) throw std::bad_alloc();
+        return static_cast<T*>(storage);
+    }
+    void deallocate(T* storage, size_t) { heap_caps_free(storage); }
+};
+
+template <typename T, typename U>
+bool operator==(const PsramAllocator<T>&, const PsramAllocator<U>&) {
+    return true;
+}
+
+template <typename T, typename U>
+bool operator!=(const PsramAllocator<T>&, const PsramAllocator<U>&) {
+    return false;
+}
+
+using ByteStorage = std::vector<uint8_t, PsramAllocator<uint8_t>>;
+#else
+using ByteStorage = std::vector<uint8_t>;
+#endif
 
 // Joypad button bits (as passed from JS)
 enum {
@@ -20,14 +67,15 @@ struct GB;
 
 // ---------------------------------------------------------------- Cartridge
 struct Cartridge {
-    std::vector<uint8_t> rom;
-    std::vector<uint8_t> ram;
+    ByteStorage rom;
+    ByteStorage ram;
     int type = 0;          // raw byte at 0x147
     int mbc = 0;           // 0=none 1=MBC1 2=MBC2 3=MBC3 5=MBC5
     bool battery = false;
     bool hasRtc = false;
     int romBanks = 2;
     int ramBanks = 0;
+    uint32_t ramGeneration = 0; // increments on SRAM writes; frontend decides when to persist
 
     // banking state
     bool ramEnable = false;
@@ -44,6 +92,8 @@ struct Cartridge {
     double rtcAccum = 0;           // fractional seconds
 
     bool load(const uint8_t* data, size_t size);
+    bool load(ByteStorage&& data);
+    bool configureLoadedRom();
     uint8_t read(uint16_t addr) const;
     void write(uint16_t addr, uint8_t v);
     void tickRtc(double seconds);
@@ -52,7 +102,7 @@ struct Cartridge {
 // ---------------------------------------------------------------- PPU
 struct PPU {
     GB* gb = nullptr;
-    uint32_t framebuffer[160 * 144];
+    Pixel framebuffer[160 * 144];
 
     uint8_t lcdc = 0x91, stat = 0x85, scy = 0, scx = 0;
     uint8_t ly = 0, lyc = 0, bgp = 0xFC, obp0 = 0xFF, obp1 = 0xFF, wy = 0, wx = 0;
@@ -70,7 +120,7 @@ struct PPU {
     void tick(int dots);           // advance by PPU dots (4.19MHz)
     void renderScanline();
     void checkStatIrq();
-    uint32_t cgbColor(const uint8_t* pal, int palIdx, int colorIdx) const;
+    Pixel cgbColor(const uint8_t* pal, int palIdx, int colorIdx) const;
 };
 
 // ---------------------------------------------------------------- APU
@@ -168,7 +218,14 @@ struct GB {
 
     bool loaded = false;
 
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+    uint64_t profileCpuUs = 0;
+    uint64_t profilePpuUs = 0;
+    uint64_t profileApuUs = 0;
+#endif
+
     bool loadRom(const uint8_t* data, size_t size);
+    bool loadRom(ByteStorage&& data);
     void reset();
     void runFrame();
 

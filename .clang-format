@@ -1,0 +1,18 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: true
+SpacesBeforeTrailingComments: 3
+SortIncludes: false
+IndentPPDirectives: None
+AlignTrailingComments: false
+DerivePointerAlignment: false
+PointerAlignment: Left
+NamespaceIndentation: None
+ReflowComments: false

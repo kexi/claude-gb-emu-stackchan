@@ -1,12 +1,26 @@
 // GB system: bus, timer, DMA, and the WASM API
 #include "gb.h"
 
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+#include <esp_timer.h>
+#endif
+
 namespace gb {
 
 bool GB::loadRom(const uint8_t* data, size_t size) {
     if (!cart.load(data, size)) return false;
     uint8_t cgbFlag = cart.rom[0x143];
     cgb = (cgbFlag & 0x80) != 0;   // CGB-capable or CGB-only → run in CGB mode
+    loaded = true;
+    reset();
+    return true;
+}
+
+bool GB::loadRom(ByteStorage&& data) {
+    const bool cartridgeLoaded = cart.load(std::move(data));
+    if (!cartridgeLoaded) return false;
+    uint8_t cgbFlag = cart.rom[0x143];
+    cgb = (cgbFlag & 0x80) != 0;
     loaded = true;
     reset();
     return true;
@@ -214,6 +228,21 @@ void GB::doHdmaBlock() {
 
 void GB::tickTimer(int cpuCycles) {
     static const int TAC_BIT[4] = {9, 3, 5, 7};
+#ifdef GB_EMBEDDED
+    const uint32_t start = divCounter;
+    const uint32_t end = start + (uint32_t)cpuCycles;
+    divCounter = (uint16_t)end;
+    if (!(tac & 4)) return;
+
+    const uint32_t period = 1u << (TAC_BIT[tac & 3] + 1);
+    const uint32_t fallingEdges = end / period - start / period;
+    for (uint32_t edge = 0; edge < fallingEdges; edge++) {
+        if (++tima == 0) {
+            tima = tma;
+            requestInterrupt(INT_TIMER);
+        }
+    }
+#else
     for (int i = 0; i < cpuCycles; i++) {
         uint16_t prev = divCounter;
         divCounter++;
@@ -227,6 +256,7 @@ void GB::tickTimer(int cpuCycles) {
             }
         }
     }
+#endif
 }
 
 void GB::tick(int cpuCycles) {
@@ -242,17 +272,36 @@ void GB::tick(int cpuCycles) {
     }
     // PPU and APU run at the fixed 4.19 MHz dot clock
     int dots = doubleSpeed ? cpuCycles / 2 : cpuCycles;
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+    int64_t componentStartedUs = esp_timer_get_time();
+#endif
     ppu.tick(dots);
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+    profilePpuUs += esp_timer_get_time() - componentStartedUs;
+    componentStartedUs = esp_timer_get_time();
+#endif
     apu.tick(dots);
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+    profileApuUs += esp_timer_get_time() - componentStartedUs;
+#endif
     cart.tickRtc(dots / 4194304.0);
 }
 
 void GB::runFrame() {
     if (!loaded) return;
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+    profileCpuUs = profilePpuUs = profileApuUs = 0;
+#endif
     ppu.frameDone = false;
     int budget = 70224 * 2 * 4;  // safety cap (in CPU cycles, double speed worst case)
     while (!ppu.frameDone && budget > 0) {
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+        const int64_t cpuStartedUs = esp_timer_get_time();
+#endif
         int c = cpu.step();
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+        profileCpuUs += esp_timer_get_time() - cpuStartedUs;
+#endif
         tick(c);
         budget -= c;
         if (!(ppu.lcdc & 0x80) && budget < 70224) break; // LCD off: just cap the frame
@@ -290,7 +339,7 @@ API int gb_load_rom(int size) {
 API void gb_reset() { if (g_gb && g_gb->loaded) g_gb->reset(); }
 API void gb_frame() { if (g_gb) g_gb->runFrame(); }
 
-API uint32_t* gb_framebuffer() { return g_gb ? g_gb->ppu.framebuffer : nullptr; }
+API gb::Pixel* gb_framebuffer() { return g_gb ? g_gb->ppu.framebuffer : nullptr; }
 
 API void gb_set_buttons(int buttons) {
     if (!g_gb) return;

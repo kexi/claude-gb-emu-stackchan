@@ -1,0 +1,4 @@
+title = "claude-gb-emu-stackchan gitleaks configuration"
+
+[extend]
+useDefault = true
