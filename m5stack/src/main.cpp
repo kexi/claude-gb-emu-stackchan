@@ -926,7 +926,18 @@ void gameLoop() {
 
     nextFrameUs += GB_FRAME_US;
     const int64_t remainingUs = nextFrameUs - esp_timer_get_time();
-    if (remainingUs > 0) delayMicroseconds((uint32_t)remainingUs);
+    // Why not an adaptive resampler rate instead: pulling the source rate to
+    // the ring depth turns frame jitter into audible FM pitch wobble, so the
+    // ring is refilled by emulating ahead of wall clock while the speaker
+    // keeps consuming at a fixed 44.1 kHz.
+    const bool audioNeedsLead = useFmSound && audioAvailable() < AUDIO_TARGET_LEAD_SAMPLES;
+    if (remainingUs > 0) {
+        if (audioNeedsLead) {
+            nextFrameUs -= remainingUs;
+        } else {
+            delayMicroseconds((uint32_t)remainingUs);
+        }
+    }
     const bool badlyBehind = esp_timer_get_time() - nextFrameUs > GB_FRAME_US * 3;
     if (badlyBehind) nextFrameUs = esp_timer_get_time();
 }

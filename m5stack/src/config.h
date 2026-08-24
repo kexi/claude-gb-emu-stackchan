@@ -31,15 +31,27 @@ constexpr int AUDIO_RING_SAMPLES = 8192;
 constexpr int AUDIO_RING_MASK = AUDIO_RING_SAMPLES - 1;
 constexpr int AUDIO_CHUNK_SAMPLES = 512;
 constexpr int AUDIO_CHUNK_SLOTS = 4;
-constexpr int AUDIO_MIX_RING_SAMPLES = 2048;
+constexpr int AUDIO_MIX_RING_SAMPLES = 8192;
 constexpr int AUDIO_MIX_RING_MASK = AUDIO_MIX_RING_SAMPLES - 1;
 constexpr uint32_t AUDIO_ALIGNMENT_LOOKAHEAD_SAMPLES = 2048;
+// FM demo fill sections cost almost the whole 16.74 ms frame budget on Core 1,
+// so wall-clock pacing alone left a measured worst deficit of 5,504 samples
+// and drained the speaker queue. Emulation runs ahead of wall clock until this
+// many samples (producer ring + mix ring) are banked ahead of the speaker.
+// The renderer keeps ALIGNMENT_LOOKAHEAD samples of that bank held back, and
+// fills run a further multi-second deficit, so an 8,192 target still let the
+// usable bank dip below one output chunk on the device.
+constexpr int AUDIO_TARGET_LEAD_SAMPLES = 14336;
 constexpr uint32_t AUDIO_WORKER_IDLE_INTERVAL_SAMPLES = 4096;
 constexpr uint32_t AUDIO_RESAMPLE_ONE = 1U << 16;
 static_assert((AUDIO_RING_SAMPLES & AUDIO_RING_MASK) == 0, "audio ring size must be a power of two");
 static_assert((AUDIO_MIX_RING_SAMPLES & AUDIO_MIX_RING_MASK) == 0, "mix ring size must be a power of two");
 static_assert(AUDIO_ALIGNMENT_LOOKAHEAD_SAMPLES < AUDIO_RING_SAMPLES,
               "alignment lookahead must fit in the producer PCM ring");
+static_assert(AUDIO_TARGET_LEAD_SAMPLES < AUDIO_RING_SAMPLES + AUDIO_MIX_RING_SAMPLES,
+              "audio lead target must stay reachable inside the producer and mix rings");
+static_assert(AUDIO_TARGET_LEAD_SAMPLES > static_cast<int>(AUDIO_ALIGNMENT_LOOKAHEAD_SAMPLES),
+              "audio lead target must bank samples beyond the alignment lookahead hold-back");
 static_assert(SPEAKER_DMA_BUFFER_SAMPLES <= 1024, "M5Unified limits one speaker DMA buffer to 1024 samples");
 static_assert(SPEAKER_TASK_PRIORITY > AUDIO_WORKER_TASK_PRIORITY, "speaker DMA feeding must preempt FM rendering");
 static_assert(AUDIO_WORKER_TASK_PRIORITY > GROVE_TASK_PRIORITY,

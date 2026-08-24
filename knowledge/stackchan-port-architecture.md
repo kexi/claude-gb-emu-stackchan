@@ -5,7 +5,7 @@ description: ブラウザ向け GB/GBC コアを M5Stack CoreS3 上で安全か�
 tags: [architecture, embedded, emulator, performance, stackchan]
 status: draft
 generated: { by: codex/gpt-5, at: 2026-08-24T00:00:00+09:00 }
-verified: { by: process:codex-host-sample-parity-and-cores3-runtime-measurement, at: 2026-08-25T00:00:00+09:00 }
+verified: { by: process:codex-host-sample-parity-and-cores3-runtime-measurement, at: 2026-08-25T01:20:00+09:00 }
 sources:
   - id: local-gb-core
     resource: ../core
@@ -109,7 +109,7 @@ CoreS3 では PPU の pixel 型を byte-swapped RGB565 にし、M5GFX の `setSw
 
 コアは44.1 kHz stereo floatを生成する。CoreS3フロントエンドで左右平均、saturating int16変換、DC blockerを行い、8,192 sampleのpower-of-two ringへ積む。16.16固定小数点の位相連続linear resamplerで512 sampleの出力chunkを作るが、sourceとM5Unifiedの再生rateはともに常時44.1 kHzとする。再生中ポインタを上書きしないよう4 slotを回し、M5Unifiedの2 slot speaker queueが埋まっている間は`playRaw`を呼ばない。
 
-GBの目標フレーム周期は70,224 / 4,194,304 = 約16.7427 ms（約59.7275 Hz）。処理がこれより速い場合はフレーム境界で待つ。遅延はPCM ringとspeaker DMAで吸収し、wall-clock上の短期的なfps揺れをresampler source rateへ反映しない。1 emulated frameが生成するsample数はCPU cycle基準で決まるため、source rateを変えるとゲーム本来の音程を変調してしまう。
+GBの目標フレーム周期は70,224 / 4,194,304 = 約16.7427 ms（約59.7275 Hz）。処理がこれより速い場合はフレーム境界で待つが、FM選択時はPCM ring＋mix ringの合計が14,336 samplesに達するまで待ちを省き、エミュレーションをwall clockより先行させて音声を貯金する。遅延はPCM ringとspeaker DMAで吸収し、wall-clock上の短期的なfps揺れをresampler source rateへ反映しない。1 emulated frameが生成するsample数はCPU cycle基準で決まるため、source rateを変えるとゲーム本来の音程を変調してしまう。先行貯金は音程・テンポを変えず、映像が音響より最大約325 ms先行するAV offsetだけを代償とする。
 
 CoreS3の内蔵speakerと内蔵micはBCLK/WSとI2S1を共有する。M5Unified 0.2.15は両者を別driverとして排他的に扱い、公式microphone exampleも録音時にspeakerを停止する。このため現行APIだけではspeakerの音響loopbackを内蔵micで同時収録できない。自動click評価を追加する場合は通常firmwareから分離した`audio-lab`環境で、ESP-IDFのI2S TX+RX full-duplex driverへ所有権を一本化して検証する。通常版へ未検証のcodec制御を混ぜない。
 
@@ -149,7 +149,8 @@ KANTANの自動演奏はフロントエンド側でコード進行を生成し�
 4. 実機では ROM 起動、入力全ボタン、LCD の tearing、音声 underrun、SD 抜き差し、SRAM 復元を監督下で確認する。
 5. 30 秒以上のログで p95 frame time と最小 audio ring を見てから、第 2 段階の CPU dispatch / IRAM / bank cache の要否を決める。
 6. KANTAN内蔵デモでは同期rendererとdeferred event replayを同じROM・入力で実行し、eventをtimestampのsample生成直前に適用したstereo PCMがsample単位で完全一致することを確認する。
-7. 固定KANTAN ROMの音響整列後は、CH2 key-onからADPCM playまで64 samples以下、ADPCM playからYM noiseハイハットまで64 samples以下、ベースまで128 samples以下、全one-shotでFIFO starvation 0、alignment failure 0とする。さらに連続打音では有効STOP→PLAY間隔を0 sample、再トリガー境界の出力段差を1 LSB以下とする。10分間の内蔵デモでoffset変動1 sample以下、FIFO reject、late event、audio underrun/drop/clip、PCM/event backpressureをすべて0とし、利用者の同一音量での聴取確認を最終gateにする。
+7. 実機のFM autoplayを300秒連続で計測し、`speaker_queue_empty`が起動直後の1回から増えないこと、`audio_underruns`、`audio_dropped`、`audio_output_clips`、`adpcm_fifo_rejected`、`alignment_failures`、`speaker_queue_failures`、`event_backpressure`がすべて0であることを確認する。`audio_backpressure`は先行生成時の待機回数なので0を要求しない。
+8. 固定KANTAN ROMの音響整列後は、CH2 key-onからADPCM playまで64 samples以下、ADPCM playからYM noiseハイハットまで64 samples以下、ベースまで128 samples以下、全one-shotでFIFO starvation 0、alignment failure 0とする。さらに連続打音では有効STOP→PLAY間隔を0 sample、再トリガー境界の出力段差を1 LSB以下とする。10分間の内蔵デモでoffset変動1 sample以下、FIFO reject、late event、audio underrun/drop/clip、PCM/event backpressureをすべて0とし、利用者の同一音量での聴取確認を最終gateにする。
 
 # 非目標
 
@@ -216,6 +217,13 @@ KANTANの自動演奏はフロントエンド側でコード進行を生成し�
 - main push後のGitHub Actions run `32742629269`では`nix flake check`と音響検証まで通ったが、Linuxの`clang-tidy`が通常Clangのlibstdc++探索と明示したlibc++ headerを混在させ、標準`math.h`で160 errorsとなった。さらにhost検証の配列長計算が`bugprone-sizeof-expression`に違反した。devShellのcompilerを`llvmPackages.libcxxClang`へ統一し、配列長を`std::size`へ変更した候補で、macOS上の`just fmt-check`、`nix flake check`、`nix develop --command just clang-tidy`が成功した。Linux CIでの再検証は修正push後に行う。
 - 修正run `32743108266`でもLinux clang-tidyはホストGCCの既定C++ headerを追加し、libc++との混在が残った。Nixのcompiler package変更だけではcompile databaseをclang-tidyが再解釈する際の既定探索を制御できないため、CMake生成時のcompile flagsへ`-nostdinc++`を追加し、`GB_CLANG_CXX_INCLUDE`で明示したlibc++だけを使わせる方針へ訂正した。この候補はmacOS Nix devShellで8 translation unitsのclang-tidyを通過した。Linux CIでの再検証は再push後に行う。
 - mainへ再pushしたGitHub Actions run `32743523810`は4分55秒で成功した。Linux上の`nix flake check`と`nix develop --command just ci`がともに通過し、`-nostdinc++`によるlibc++ header分離が実CIでも有効であること、およびADPCM修正を含むmainの全CI検証が完了したことを確認した。
+- 「ADPCM再生が追いつかない」という利用者報告を、修正前firmwareの実機ログ（`device-20260824-223034.jsonl`、GB_PROFILE + autoplay、243秒・14,612 frame）で切り分けた。`adpcm_fifo_rejected`、`alignment_failures`、`audio_underruns`、`audio_dropped`、`speaker_queue_failures`はすべて0であり、転送欠落でも整列失敗でもなかった。真の原因はCore 1の生成不足である。同ログのfpsは54.35〜62.75で、1秒窓ごとの生成sample数は最小40,441に落ち、44,100 samples/sに対する累積不足は最悪5,504 samples（約125 ms）に達した。`speaker_queue_empty`は起動直後の1回から62回まで増え続けており、speaker側が実際に枯渇していた。fpsが落ちる窓はcore時間も伸びており（cpu 4.0→7.5 ms、ppu 2.7→3.7 ms、apu 2.1→2.8 ms）、KANTAN内蔵デモのfill区間が16.74 ms予算をほぼ使い切ることが不足の実体だった。
+- 適応resampler rateは音程を変調するため再採用しない（2026-08-24の訂正を維持）。代わりにwall-clock pacingを条件付きにし、FM選択時はPCM ring＋mix ringの合計が`AUDIO_TARGET_LEAD_SAMPLES`未満の間はフレーム末尾の`delayMicroseconds`を省いて`nextFrameUs`を実時刻へ引き戻す。speakerは44,100 Hz固定のまま消費し、貯金が満ちれば通常の待ちに戻る。mix ringは2,048から8,192 samplesへ拡大した。
+- 目標貯金8,192 samplesの候補をCoreS3へ書き込み、300秒・18,872 frameを計測した。`speaker_queue_empty`は5分で6回まで減った（修正前は同じ長さで約20回相当、243秒で62回）が0にはならず、ringは2,917〜9,071 samplesで、1秒窓の最小生成は37,823 samplesだった。renderer が`ALIGNMENT_LOOKAHEAD`の2,048 samplesを常に保留するため、貯金8,192では利用可能分が出力chunk（512 samples）を割る窓が残ると判断した。
+- 目標貯金を14,336 samplesへ引き上げた候補を書き込み、同条件で300秒・18,083 frameを計測した。`speaker_queue_empty`は起動直後の1回から一度も増えず、ringは6,009〜15,069 samples、`audio_underruns`、`audio_dropped`、`audio_output_clips`、`adpcm_fifo_rejected`、`alignment_failures`、`speaker_queue_failures`、`event_backpressure`はすべて0だった。1秒窓の最小生成は39,252 samplesと不足自体は残るが、貯金が吸収しきっている。`audio_backpressure`は1,879,720まで増えたが、これはCore 1が先行生成してPCM ringが満杯のときの待機回数であり、sample欠落ではなく意図した流量制御である。
+- 同じ修正をホスト側の波形でも確認した。KANTAN内蔵デモ3,500 frameを同期rendererとCoreS3相当（deferred producer + aligner + DC blocker + 0.9 gain）で16-bit monoへ書き出し、演奏中に前後が有音のまま5 msのRMSが無音へ落ちる区間は両者とも0件だった。整列版の最大隣接sample差は8,517で、その近傍はADPCMアタックの立ち上がりであり不連続なクリックではない。秒ごとのRMS比（整列版/同期版）は1.173〜1.282、平均1.207で、ADPCM mix gain 0.75による意図した増分と一致する。
+- 上記の実機計測は`GB_PROFILE`付きautoplayビルドで行った。過去の記録どおり命令単位cycle計測は約5 fpsの摂動を持つため、これらのfps値をそのまま製品性能として扱わない。非計測版autoplay firmware（静的RAM 267,596 B / 81.7%、Flash 656,013 B / 10.0%）を書き込み済みで、利用者の聴取確認は未完了である。
+- 実機ログ取得中、`just logs`が3回連続で0 byteになった。修正前HEADのfirmwareでも同じだったため変更起因ではない。`esptool --no-stub --after hard_reset`でMACを読んでリセットすると復旧したので、原因はfirmwareではなく直前の書き込み後にUSB-Serial/JTAGがdownload状態に留まったことである。0 byteログを見たらまずhard resetをかける。
 
 [^local-gb-core]: 現行 `core/` の 2026-08-24 時点のソース調査。
 [^nes-stackchan-port]: NES 移植例の `core/`、`m5stack/`、ホスト比較 harness、性能関連コミットの調査。
