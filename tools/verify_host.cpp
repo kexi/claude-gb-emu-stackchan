@@ -230,8 +230,7 @@ int runVerification(int argc, char** argv) {
         system->apu.sampleCount = 0;
     }
 
-    const size_t distinctPixels = countDistinctPixels(system->ppu.framebuffer, sizeof(system->ppu.framebuffer) /
-                                                                                   sizeof(system->ppu.framebuffer[0]));
+    const size_t distinctPixels = countDistinctPixels(system->ppu.framebuffer, std::size(system->ppu.framebuffer));
     const bool externalRomRenderedImage = !usesExternalRom || distinctPixels > 1;
 
     std::printf("frames=%u pc=%04x sp=%04x regs=%02x%02x%02x%02x%02x%02x ", system->ppu.frameCount, system->cpu.pc,

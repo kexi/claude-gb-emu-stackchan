@@ -37,7 +37,7 @@
           packages = [
             pkgs.actionlint
             pkgs.cmake
-            pkgs.clang
+            pkgs.llvmPackages.libcxxClang
             pkgs.clang-tools
             pkgs.emscripten
             pkgs.gitleaks
