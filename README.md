@@ -38,6 +38,8 @@ just build
 just flash <port> yes # only when a device is connected and its firmware should be replaced
 ```
 
+All tooling is pinned in `flake.nix`, so Nix is the only prerequisite. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full setup, the task list, and the verification workflow.
+
 The frontend supports the display, speaker, microSD, built-in touch buttons, Grove Joystick, and Dual Button unit. See [m5stack/README.md](m5stack/README.md) for wiring, controls, and performance logs, and [knowledge/stackchan-port-architecture.md](knowledge/stackchan-port-architecture.md) for design decisions and verification criteria.
 
 ### WebAssembly

@@ -38,6 +38,8 @@ just build
 just flash <port> yes # 実機を接続し、既存 firmware を置換する場合だけ
 ```
 
+ツール一式は `flake.nix` に固定してあるため、自分で入れるのは Nix だけです。環境構築、コマンド一覧、検証の進め方は [CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) を参照してください。
+
 画面、スピーカー、microSD、本体タッチに加え、Grove Joystick / Dual Button を使えます。配線、操作、性能ログは [m5stack/README.md](m5stack/README.md)、設計判断と検証条件は [knowledge/stackchan-port-architecture.md](knowledge/stackchan-port-architecture.md) を参照してください。
 
 ### WebAssembly
