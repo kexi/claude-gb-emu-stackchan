@@ -5,7 +5,7 @@ description: ブラウザ向け GB/GBC コアを M5Stack CoreS3 上で安全か�
 tags: [architecture, embedded, emulator, performance, stackchan]
 status: draft
 generated: { by: codex/gpt-5, at: 2026-08-24T00:00:00+09:00 }
-verified: { by: process:codex-build-host-and-device-check, at: 2026-08-24T14:48:47+09:00 }
+verified: { by: process:codex-host-crc-and-cores3-runtime-measurement, at: 2026-08-24T18:30:00+09:00 }
 sources:
   - id: local-gb-core
     resource: ../core
@@ -30,6 +30,10 @@ sources:
     title: M5Unified 0.2.15 StackChan support release
     author: team:m5stack
     last_modified: 2026-05-15T05:36:53Z
+  - id: ym2151-claude
+    resource: https://github.com/GOROman/YM2151-Claude-3.7-Sonnet
+    title: C++17 YM2151 FM sound emulator
+    author: person:GOROman
 ---
 
 # 目的と完了条件
@@ -63,7 +67,8 @@ ROM 選択メニュー中はエミュレーションと DMA バンド転送を�
 | データ | 形式・概算 | 配置 | 理由 |
 | --- | --- | --- | --- |
 | ネイティブ画面 | 160×144×2 = 46,080 B | internal DMA-capable SRAM | PPU の書き込みを軽くし、色変換を除く |
-| LCD band × 2 | 240×54×2×2 = 51,840 B | internal DMA-capable SRAM | 変換とSPI転送を重ね、全拡大画面より約 52 KiB 小さい |
+| LCD snapshot | 160×144×2 = 46,080 B | internal SRAM | 4 bandの送信中にPPUが次フレームを書いても表示内容を固定する |
+| LCD band × 1 | 240×54×2 = 25,920 B | internal DMA-capable SRAM | 次フレーム冒頭で前回DMAをjoinしてから再利用する |
 | 音声リング | 8,192×int16 = 16,384 B | internal SRAM | サンプル単位の高頻度アクセスを PSRAM に逃がさない |
 | ROM | 初期版は最大 4 MiB | PSRAM、単一所有 | 8 MiB PSRAM 上で読み込み時の二重保持と枯渇を避ける |
 | 現在の ROM bank | 16 KiB 単位の窓 | 初期版は ROM 上の直接窓、計測後に cache を判断 | 推測で 32 KiB を予約せず、PSRAM 待ちを先に計測する |
@@ -75,24 +80,30 @@ NES 例の「DMA 元は PSRAM に置かない」「巨大 ROM 全体より頻繁
 
 GB の 10:9 を保ち、各軸 3:2 の nearest-neighbor で 240×216 にする。320×240 内では左右 40 px、上下 12 px の余白になる。整数 1 倍の 160×144 より読みやすく、全画面 5:3 拡大より計算が単純で、画面バッファも小さい。
 
-PPU は 160×144 のネイティブ画面だけを生成する。LCD更新時に240×54の2本のバンドバッファへ3:2拡大し、一方をSPI DMAで転送中に他方を変換する。1バンドは `240 * 54 * 2 = 25,920 B` でESP32-S3 SPIの32 KiB未満に収まる。M5GFXがStackChan向けに採用する40 MHzでは240×216を約60 fpsで全転送できないため、CPU/APUは約59.7 fpsのまま、LCDだけ2フレームに1回（約29.9 fps）更新する。次のバッファをDMAへ渡す直前と、メニュー・SD操作への遷移前に未完了DMAをjoinする。
+PPU は 160×144 のネイティブ画面だけを生成する。4エミュレーションフレームに1度、native framebufferをsnapshotし、240×54の単一band bufferへ3:2拡大する。1フレームにつき1 bandを送るため、CPU/APUは約59.7 fpsのまま、LCDの完成画面は約14.9 fpsで更新される。1 bandは `240 * 54 * 2 = 25,920 B` でESP32-S3 SPIの32 KiB未満に収まる。
+
+M5GFXの`pushImageDMA`は単独呼び出しでは内部のtransaction終了まで待ち、実測約5.5 msをフレーム経路へ残した。外側で`startWrite()`してから呼び、次フレームのband buffer再利用前に`endWrite()`することで転送とエミュレーションを重ねる。メニュー・SD操作への遷移時にも必ず`endWrite()`して、共有SPI busの所有権を同期的に戻す。この構造ではbufferを1本にでき、DMA起動区間は実測約0.33 msになった。
 
 CoreS3 では PPU の pixel 型を byte-swapped RGB565 にし、M5GFX の `setSwapBytes(false)` で bounce buffer を避ける。Web / ホストでは従来の 32-bit RGBA を維持する。
 
 # コア高速化
 
-最初から意味論を変えない次の二つだけを組込みモードへ入れる。
+実機profileとホストCRC比較を交互に行い、次の最適化を組込みモードへ入れた。
 
-1. PPU の dot loop は mode 境界（1、81、253、456 dot）までまとめて進め、境界イベントだけ逐次処理する。CPU レジスタアクセス間の観測点は維持する。
-2. APU の oscillator timer は次の出力サンプル境界までまとめて減算し、sample / frame-sequencer 境界では従来と同じ順序で処理する。
+1. APUのsample accumulatorを整数化し、CPU命令単位ではcycle数だけを保留する。音声register read/writeとframe末尾でまとめて追いつき、sample / frame-sequencer境界の順序は維持する。
+2. PPUは次のmode境界へ達しない命令をevent fast pathで進める。background/windowはpixelごとのtile fetchではなくtile run単位で描画し、CGB paletteはregister write時だけ再計算する。
+3. LCDへ送らない3フレームではPPUのLY、STAT、VBlank、windowLineを進めつつpixel生成を省く。ホスト既定では全frameを描画するため、共有コアの従来挙動を維持する。
+4. RTCを持たないcartridgeではframeごとのRTC除算を行わない。
 
-CPU の 256 関数 dispatch 化、IRAM 配置、ROM bank の internal SRAM cache は実測後の第 2 段階とする。NES では巨大 switch の I-cache miss が支配的だったが、SM83 の switch サイズと ROM fetch 比率が同じとは限らないためである。計測ビルドで `cpu_us`、`ppu_us`、`apu_us` を分離し、最大要因だけを変える。[^nes-stackchan-port]
+計測はESP32-S3のCPU cycle counterを用いる。命令ごとの`esp_timer_get_time()`は計測自体の負荷が大きく、profile結果を歪めたため採用しない。32 KiB KANTAN ROMをinternal SRAMへ置く候補も比較したが、約18.7 fpsのままで改善せず、free heapだけ116 KiBから83 KiBへ減ったので撤回した。CPU dispatch化、IRAM配置、ROM bank cacheは現在のcore処理が16.74 ms予算内に入ったため追加しない。[^nes-stackchan-port]
 
 # 音声とペーシング
 
-コアは 44.1 kHz stereo float を生成する。CoreS3 フロントエンドで左右平均、saturating int16 変換、DC blocker を行い 8,192 sample の power-of-two ring へ積む。M5Unified へは 512 sample の固定 chunk で渡し、再生中ポインタを上書きしないよう 4 slot を回す。
+コアは44.1 kHz stereo floatを生成する。CoreS3フロントエンドで左右平均、saturating int16変換、DC blockerを行い、8,192 sampleのpower-of-two ringへ積む。ringの中央4,096 sampleを目標に、16.16固定小数点の位相連続linear resamplerで512 sampleの出力chunkを作る。M5Unifiedへ渡す再生rateは常に44.1 kHzに固定し、エミュレーション速度とI2S clockの微差はresamplerのsource stepだけで吸収する。再生中ポインタを上書きしないよう4 slotを回し、M5Unifiedの2 slot speaker queueが埋まっている間は`playRaw`を呼ばない。
 
-GB の目標フレーム周期は 70,224 / 4,194,304 = 約 16.7427 ms（約 59.7275 Hz）。処理がこれより速い場合はフレーム境界で待つ。遅い場合は映像をさらに間引かず、まず LCD divisor を維持したまま音声再生 rate を実測 sample 生産率へ滑らかに追従させ、underrun を避ける。60 fps 固定値ではなく GB の実周波数を正本にする。
+GBの目標フレーム周期は70,224 / 4,194,304 = 約16.7427 ms（約59.7275 Hz）。処理がこれより速い場合はフレーム境界で待つ。遅い場合もspeaker clockをchunkごとに変更しない。実測sample生産率とring深さからresampler source rateだけをslew制限付きで追従させ、waveformの位相とspeaker queueの時間軸を連続に保つ。
+
+CoreS3の内蔵speakerと内蔵micはBCLK/WSとI2S1を共有する。M5Unified 0.2.15は両者を別driverとして排他的に扱い、公式microphone exampleも録音時にspeakerを停止する。このため現行APIだけではspeakerの音響loopbackを内蔵micで同時収録できない。自動click評価を追加する場合は通常firmwareから分離した`audio-lab`環境で、ESP-IDFのI2S TX+RX full-duplex driverへ所有権を一本化して検証する。通常版へ未検証のcodec制御を混ぜない。
 
 # ROM、保存、操作
 
@@ -106,7 +117,7 @@ GB の目標フレーム周期は 70,224 / 4,194,304 = 約 16.7427 ms（約 59.7
 
 # 観測と検証
 
-本番ログは 1 秒単位の JSONL とし、少なくとも `event`、`frame`、`fps`、`frame_us`、`audio_ring_samples`、`audio_underruns`、`heap_free_bytes`、`psram_free_bytes`、`display_divisor` を一貫した名前で出す。計測ビルドだけはコア内部の CPU / PPU / APU 時間を追加する。
+本番ログは 1 秒単位の JSONL とし、`event`、`frame`、`fps`、`frame_us`、`audio_ring_samples`、`audio_underruns`、`audio_dropped`、`playback_rate_hz`、`resample_source_rate_hz`、`heap_free_bytes`、`psram_free_bytes`、`display_mode`を一貫した名前で出す。frontend区間は`input_us`、`audio_us`、`display_us`、`save_us`を分離し、計測ビルドだけはコア内部のCPU / PPU / APU cycleも追加する。
 
 検証は次の順序で行う。
 
@@ -138,7 +149,11 @@ GB の目標フレーム周期は 70,224 / 4,194,304 = 約 16.7427 ms（約 59.7
 - `esptool --no-stub` により、以前stub起動直後に切断していた同じ `/dev/cu.usbmodem2101` へKANTAN GB内蔵計測firmwareを書き込めた。bootloader、partition、applicationの全領域で書き込み後hash検証に成功した。計測版は静的RAM 178,804 B（54.6%）、Flash 610,505 B（9.3%）。USB CDCログはリセット有無の両方で0 byteのため、LCD表示と実機性能値は未検証のままである。
 - 書き込み後も全面黒との目視報告を受け、拡大、snapshot、DMA、band転送を外した160×144同期転送へ切り替え、backlightを128へ明示設定した。USB-JTAGで両coreをhaltしてPCを確認すると、core 1は `lgfx::v1::Bus_SPI::writeBytes`、core 0はidleにあり、firmwareは実行中だった。さらに実機RAMのframebuffer 46,080 byteをdumpし、`3bad`、`8b39`、`b9b5`、`bef7`、`c718`、`d78b`、`ffff` の7画素値を確認した。したがってROM、CPU/PPU、framebuffer生成、SPI送信呼出しは生きており、残る切り分け対象はLCD panel/backlight電源または実機機種判定である。
 - JTAG診断ではM5GFXが本体とLCDを`board_M5StackChan`（ID 27）、320×240、輝度255として認識する一方、M5Unified 0.2.2のPMICはunknownだった。公式タグを比較するとStackChanのPMIC、I2C、SD、speaker、入力対応は0.2.15で初めて追加され、同リリースの変更理由も`Add support StackChan`だった。0.2.15へ固定して実機へ書き込んだ結果、従来全面黒だったLCDに160×144のKANTAN GB PLAYが表示され、黒画面の原因を依存ライブラリの世代不整合と確定した。[^m5unified-stackchan]
-- 表示確認後、3:2拡大用のDMA bandを2本へ変更し、LCD約29.9 fps、CPU/APU約59.7 fpsの分離設計にした。通常firmwareは静的RAM 230,772 B（70.4%）、Flash 625,749 B（9.5%）でビルド成功し、`just check`はKANTAN GB PLAY 180 frameで`fb=400e06c2`、`audio=ad3a4bb2`を確認した。音声実機切り分けのため、内蔵speakerを明示有効化し、起動時確認音とspeaker beginの構造化ログを追加した。拡大表示と実機音声は再書き込み後に目視・聴取確認する。
+- 表示確認直後は3:2拡大用DMA bandを2本、LCD約29.9 fps、CPU/APU約59.7 fpsと見積もった。その後の実機計測で同期的なSPI待ちが支配的と分かり、snapshot 1本＋DMA band 1本、1 frame 1 band、完成画面約14.9 fpsへ訂正した。`just check`はKANTAN GB PLAY 180 frameで`fb=400e06c2`、`audio=ad3a4bb2`を確認した。
+- 実機profileでは当初約9.3 fpsだった。APU event処理、PPU tile-run描画・palette cache・mode-boundary fast path、非表示frameのpixel生成省略によりcore処理を約15.8 msまで短縮した。32 KiB ROMのinternal SRAM配置候補はfree heapを約116 KiBから83 KiBへ減らした一方で約18.7 fpsから改善しなかったため撤回した。各段階でKANTAN GB PLAY 180 frameの`fb=400e06c2`、`audio=ad3a4bb2`一致を再確認した。
+- `pushImageDMA`単独呼び出しは約5.5 ms待っていた。NES移植例と同じ外側transaction方式へ変更し、翌frameの`endWrite()`までDMAを重ねた結果、LCD区間は約0.33 ms、実機は58.5〜59.3 fpsになった。さらにゲーム中のM5本体button/touch pollを30 Hzへ落とし、Grove pollは125 Hzのまま維持した結果、59.4〜59.9 fps、input区間約0.24 msになった。
+- chunkごとにspeaker playback rateを43 kHz台から44.1 kHzへ変える方式ではringのoverflowとrate揺れが残った。speakerを44.1 kHz固定、16.16位相連続linear resamplerへ変更し、ring中央feedbackを適用した。約7,600 frameまでの実機ログでringは概ね2,900〜3,500 samples、`audio_underruns=0`、`audio_dropped=0`、speaker rate 44,100 Hzを確認した。resampler追加後のaudio frontendは約0.37 ms、静的RAM 251,148 B（76.6%）、Flash 634,313 B（9.7%）。主観的なclick消失は利用者の最終聴取待ちなので文書statusは`draft`のままとする。
+- 内蔵micによる自己録音を調査した。CoreS3はspeaker data GPIO13、mic data GPIO14で、BCLK GPIO34、WS GPIO33、I2S1を共有する。M5Unified 0.2.15のAPIと公式exampleは両者を排他利用するため、同時loopbackにはM5Unifiedの上で単に`Mic.begin()`を加えるのではなく、別診断環境でI2S TX+RX full-duplex所有者を実装する必要があると確認した。
 
 [^local-gb-core]: 現行 `core/` の 2026-08-24 時点のソース調査。
 [^nes-stackchan-port]: NES 移植例の `core/`、`m5stack/`、ホスト比較 harness、性能関連コミットの調査。

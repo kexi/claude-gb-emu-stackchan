@@ -109,10 +109,13 @@ struct PPU {
     uint8_t bcps = 0, ocps = 0;
     uint8_t bgPal[64];             // CGB background palette RAM
     uint8_t objPal[64];            // CGB object palette RAM
+    Pixel bgColorCache[32];
+    Pixel objColorCache[32];
 
     int dot = 0;                   // dot counter within current line (0-455)
     int windowLine = 0;            // internal window line counter
     bool frameDone = false;
+    bool renderThisFrame = true;
     uint32_t frameCount = 0;
     bool statLine = false;         // for STAT interrupt edge detection
 
@@ -121,6 +124,7 @@ struct PPU {
     void renderScanline();
     void checkStatIrq();
     Pixel cgbColor(const uint8_t* pal, int palIdx, int colorIdx) const;
+    void updateCgbColor(bool objectPalette, int byteIndex);
 };
 
 // ---------------------------------------------------------------- APU
@@ -129,8 +133,8 @@ struct APU {
     static const int MAX_SAMPLES = 4096;
     float sampleBuf[MAX_SAMPLES * 2];  // interleaved L,R
     int sampleCount = 0;
-    double sampleRate = 44100;
-    double sampleAccum = 0;
+    uint32_t sampleRate = 44100;
+    uint32_t sampleAccum = 0;
 
     uint8_t regs[0x30] = {0};      // FF10-FF3F shadow (wave RAM at 0x20-0x2F)
     bool enabled = true;
@@ -154,7 +158,7 @@ struct APU {
     uint16_t ch4Lfsr = 0x7FFF;
 
     void reset();
-    void setSampleRate(double r) { sampleRate = r; }
+    void setSampleRate(double r) { sampleRate = (uint32_t)(r + 0.5); }
     uint8_t read(uint8_t reg) const;
     void write(uint8_t reg, uint8_t v);
     void tick(int cycles);         // 4.19MHz cycles
@@ -218,10 +222,14 @@ struct GB {
 
     bool loaded = false;
 
+#ifdef GB_EMBEDDED
+    int apuPendingCycles = 0;
+#endif
+
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
-    uint64_t profileCpuUs = 0;
-    uint64_t profilePpuUs = 0;
-    uint64_t profileApuUs = 0;
+    uint64_t profileCpuCycles = 0;
+    uint64_t profilePpuCycles = 0;
+    uint64_t profileApuCycles = 0;
 #endif
 
     bool loadRom(const uint8_t* data, size_t size);
@@ -236,6 +244,9 @@ struct GB {
 
     void requestInterrupt(uint8_t bit) { ifReg |= bit; }
     void tick(int cpuCycles);      // advance peripherals by CPU T-cycles
+#ifdef GB_EMBEDDED
+    void flushApu();
+#endif
     void tickTimer(int cpuCycles);
     void doOamDma(uint8_t page);
     void doHdmaBlock();            // one 16-byte block at hblank

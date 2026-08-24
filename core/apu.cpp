@@ -216,6 +216,67 @@ void APU::mixSample() {
 }
 
 void APU::tick(int cycles) {
+#ifdef GB_EMBEDDED
+    constexpr uint32_t APU_CLOCK_HZ = 4194304;
+    constexpr int FRAME_SEQUENCER_CYCLES = 8192;
+    while (cycles > 0) {
+        int advance = cycles;
+        const auto stopAtTimer = [&advance](bool channelOn, int timer) {
+            if (!channelOn) return;
+            const int cyclesToEvent = timer > 0 ? timer : 1;
+            if (cyclesToEvent < advance) advance = cyclesToEvent;
+        };
+        stopAtTimer(ch1On, ch1Timer);
+        stopAtTimer(ch2On, ch2Timer);
+        stopAtTimer(ch3On, ch3Timer);
+        stopAtTimer(ch4On, ch4Timer);
+
+        const int cyclesToSequencer = FRAME_SEQUENCER_CYCLES - fsClock;
+        if (cyclesToSequencer < advance) advance = cyclesToSequencer;
+        if (sampleRate > 0) {
+            const uint32_t phaseRemaining = APU_CLOCK_HZ - sampleAccum;
+            const int cyclesToSample = (phaseRemaining + sampleRate - 1) / sampleRate;
+            if (cyclesToSample < advance) advance = cyclesToSample;
+        }
+
+        if (ch1On) ch1Timer -= advance;
+        if (ch2On) ch2Timer -= advance;
+        if (ch3On) ch3Timer -= advance;
+        if (ch4On) ch4Timer -= advance;
+        fsClock += advance;
+        sampleAccum += advance * sampleRate;
+        cycles -= advance;
+
+        // Keep the cycle-boundary ordering identical to the scalar loop below.
+        if (ch1On && ch1Timer <= 0) {
+            ch1Timer = (2048 - (regs[0x03] | ((regs[0x04] & 7) << 8))) * 4;
+            ch1Pos = (ch1Pos + 1) & 7;
+        }
+        if (ch2On && ch2Timer <= 0) {
+            ch2Timer = (2048 - (regs[0x08] | ((regs[0x09] & 7) << 8))) * 4;
+            ch2Pos = (ch2Pos + 1) & 7;
+        }
+        if (ch3On && ch3Timer <= 0) {
+            ch3Timer = (2048 - (regs[0x0D] | ((regs[0x0E] & 7) << 8))) * 2;
+            ch3Pos = (ch3Pos + 1) & 31;
+        }
+        if (ch4On && ch4Timer <= 0) {
+            static const int DIV[8] = {8, 16, 32, 48, 64, 80, 96, 112};
+            ch4Timer = DIV[regs[0x12] & 7] << (regs[0x12] >> 4);
+            const int bit = (ch4Lfsr ^ (ch4Lfsr >> 1)) & 1;
+            ch4Lfsr = (ch4Lfsr >> 1) | (bit << 14);
+            if (regs[0x12] & 8) ch4Lfsr = (ch4Lfsr & ~0x40) | (bit << 6);
+        }
+        if (fsClock >= FRAME_SEQUENCER_CYCLES) {
+            fsClock = 0;
+            stepFrameSequencer();
+        }
+        if (sampleAccum >= APU_CLOCK_HZ) {
+            sampleAccum -= APU_CLOCK_HZ;
+            mixSample();
+        }
+    }
+#else
     while (cycles-- > 0) {
         // channel timers
         if (ch1On && --ch1Timer <= 0) {
@@ -241,11 +302,12 @@ void APU::tick(int cycles) {
         if (++fsClock >= 8192) { fsClock = 0; stepFrameSequencer(); }
         // output sampling
         sampleAccum += sampleRate;
-        if (sampleAccum >= 4194304.0) {
-            sampleAccum -= 4194304.0;
+        if (sampleAccum >= 4194304) {
+            sampleAccum -= 4194304;
             mixSample();
         }
     }
+#endif
 }
 
 } // namespace gb

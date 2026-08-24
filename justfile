@@ -108,6 +108,10 @@ rom:
 build-profile: rom
     cd m5stack && pio run -e m5stack-cores3-profile
 
+# KANTAN GB PLAY の内蔵デモを自動開始する診断版をビルドする
+build-autoplay: rom
+    cd m5stack && pio run -e m5stack-cores3-autoplay
+
 # M5Stack CoreS3 へ通常版を書き込む（既存 firmware を置換するため yes 必須）
 flash port confirm='':
     #!/bin/bash
@@ -131,6 +135,18 @@ flash-profile port confirm='':
     bash ./m5stack/scripts/fetch-rom.sh
     cd m5stack
     pio run -e m5stack-cores3-profile -t upload --upload-port "{{ port }}"
+
+# KANTAN GB PLAY の内蔵デモを自動開始する診断版を書き込む（既存 firmware を置換するため yes 必須）
+flash-autoplay port confirm='':
+    #!/bin/bash
+    set -euo pipefail
+    if [[ "{{ confirm }}" != "yes" ]]; then
+        echo "書き込むには just flash-autoplay <port> yes を指定してください" >&2
+        exit 2
+    fi
+    bash ./m5stack/scripts/fetch-rom.sh
+    cd m5stack
+    pio run -e m5stack-cores3-autoplay -t upload --upload-port "{{ port }}"
 
 # M5Stack CoreS3 のシリアルログを表示する
 monitor port='':

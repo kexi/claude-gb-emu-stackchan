@@ -2,7 +2,7 @@
 #include "gb.h"
 
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
-#include <esp_timer.h>
+#include <esp_cpu.h>
 #endif
 
 namespace gb {
@@ -31,6 +31,9 @@ void GB::reset() {
     cpu.reset(cgb);
     ppu.reset(cgb);
     apu.reset();
+#ifdef GB_EMBEDDED
+    apuPendingCycles = 0;
+#endif
     memset(vram, 0, sizeof(vram));
     memset(wram, 0, sizeof(wram));
     memset(oam, 0, sizeof(oam));
@@ -84,6 +87,10 @@ void GB::write(uint16_t addr, uint8_t v) {
 }
 
 uint8_t GB::readIO(uint8_t reg) {
+#ifdef GB_EMBEDDED
+    const bool readsAudioState = reg >= 0x10 && reg <= 0x3F;
+    if (readsAudioState) flushApu();
+#endif
     if (fm.enabled && reg >= 0x28 && reg <= 0x2F) return fm.read(reg - 0x28);
     switch (reg) {
     case 0x00: return joypRead();
@@ -128,6 +135,10 @@ uint8_t GB::readIO(uint8_t reg) {
 }
 
 void GB::writeIO(uint8_t reg, uint8_t v) {
+#ifdef GB_EMBEDDED
+    const bool changesAudioState = reg >= 0x10 && reg <= 0x3F;
+    if (changesAudioState) flushApu();
+#endif
     if (fm.enabled && reg >= 0x28 && reg <= 0x2F) { fm.write(reg - 0x28, v); return; }
     switch (reg) {
     case 0x00: joyp = (joyp & 0xCF) | (v & 0x30); return;
@@ -186,14 +197,18 @@ void GB::writeIO(uint8_t reg, uint8_t v) {
     case 0x68: if (cgb) ppu.bcps = v & 0xBF; return;
     case 0x69:
         if (cgb) {
-            ppu.bgPal[ppu.bcps & 0x3F] = v;
+            const int paletteIndex = ppu.bcps & 0x3F;
+            ppu.bgPal[paletteIndex] = v;
+            ppu.updateCgbColor(false, paletteIndex);
             if (ppu.bcps & 0x80) ppu.bcps = 0x80 | ((ppu.bcps + 1) & 0x3F);
         }
         return;
     case 0x6A: if (cgb) ppu.ocps = v & 0xBF; return;
     case 0x6B:
         if (cgb) {
-            ppu.objPal[ppu.ocps & 0x3F] = v;
+            const int paletteIndex = ppu.ocps & 0x3F;
+            ppu.objPal[paletteIndex] = v;
+            ppu.updateCgbColor(true, paletteIndex);
             if (ppu.ocps & 0x80) ppu.ocps = 0x80 | ((ppu.ocps + 1) & 0x3F);
         }
         return;
@@ -273,39 +288,60 @@ void GB::tick(int cpuCycles) {
     // PPU and APU run at the fixed 4.19 MHz dot clock
     int dots = doubleSpeed ? cpuCycles / 2 : cpuCycles;
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
-    int64_t componentStartedUs = esp_timer_get_time();
+    const uint32_t componentStartedCycles = esp_cpu_get_ccount();
 #endif
     ppu.tick(dots);
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
-    profilePpuUs += esp_timer_get_time() - componentStartedUs;
-    componentStartedUs = esp_timer_get_time();
+    profilePpuCycles += esp_cpu_get_ccount() - componentStartedCycles;
 #endif
+#ifdef GB_EMBEDDED
+    apuPendingCycles += dots;
+#else
     apu.tick(dots);
-#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
-    profileApuUs += esp_timer_get_time() - componentStartedUs;
 #endif
-    cart.tickRtc(dots / 4194304.0);
+    const bool rtcAdvances = cart.hasRtc && !(cart.rtcLive[4] & 0x40);
+    if (rtcAdvances) cart.tickRtc(dots / 4194304.0);
 }
+
+#ifdef GB_EMBEDDED
+void GB::flushApu() {
+    if (apuPendingCycles <= 0) return;
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+    const uint32_t startedCycles = esp_cpu_get_ccount();
+#endif
+    apu.tick(apuPendingCycles);
+    apuPendingCycles = 0;
+#if defined(GB_PROFILE) && defined(ESP_PLATFORM)
+    profileApuCycles += esp_cpu_get_ccount() - startedCycles;
+#endif
+}
+#endif
 
 void GB::runFrame() {
     if (!loaded) return;
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
-    profileCpuUs = profilePpuUs = profileApuUs = 0;
+    profileCpuCycles = profilePpuCycles = profileApuCycles = 0;
 #endif
     ppu.frameDone = false;
     int budget = 70224 * 2 * 4;  // safety cap (in CPU cycles, double speed worst case)
     while (!ppu.frameDone && budget > 0) {
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
-        const int64_t cpuStartedUs = esp_timer_get_time();
+        const uint32_t cpuStartedCycles = esp_cpu_get_ccount();
+        const uint64_t apuCyclesBefore = profileApuCycles;
 #endif
         int c = cpu.step();
 #if defined(GB_PROFILE) && defined(ESP_PLATFORM)
-        profileCpuUs += esp_timer_get_time() - cpuStartedUs;
+        const uint32_t cpuAndApuCycles = esp_cpu_get_ccount() - cpuStartedCycles;
+        const uint64_t nestedApuCycles = profileApuCycles - apuCyclesBefore;
+        profileCpuCycles += cpuAndApuCycles - nestedApuCycles;
 #endif
         tick(c);
         budget -= c;
         if (!(ppu.lcdc & 0x80) && budget < 70224) break; // LCD off: just cap the frame
     }
+#ifdef GB_EMBEDDED
+    flushApu();
+#endif
 }
 
 } // namespace gb

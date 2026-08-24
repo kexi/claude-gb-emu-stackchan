@@ -31,6 +31,20 @@ struct DisplayDiagnostic {
 volatile DisplayDiagnostic displayDiagnostic = {0x47424449, 0xFFFFFFFF, 0xFFFFFFFF, 0, 0, 0, 0, 0xFFFFFFFF};
 static_assert(sizeof(DisplayDiagnostic) == 32, "JTAG display diagnostic layout must stay stable");
 
+struct AudioDiagnostic {
+    uint32_t magic;
+    uint32_t input;
+    uint32_t produced;
+    uint32_t peak;
+    uint32_t ringSamples;
+    uint32_t speakerQueue;
+    uint32_t chunksQueued;
+    uint32_t speakerRunning;
+};
+
+volatile AudioDiagnostic audioDiagnostic = {0x44554147, 0, 0, 0, 0, 0, 0, 0};
+static_assert(sizeof(AudioDiagnostic) == 32, "JTAG audio diagnostic layout must stay stable");
+
 enum class RomSource : uint8_t { BuiltIn, Sd };
 
 struct RomEntry {
@@ -50,9 +64,12 @@ uint8_t previousMenuButtons = 0;
 AppMode appMode = AppMode::Menu;
 char currentRomName[ROM_NAME_MAX] = {};
 bool sdMounted = false;
+uint32_t gameStartedMs = 0;
 
 bool displayDmaOutstanding = false;
-alignas(4) uint16_t displayBandBuffers[2][DISPLAY_WIDTH * DISPLAY_BAND_ROWS];
+int displayBandIndex = 0;
+alignas(4) uint16_t displaySnapshot[GB_WIDTH * GB_HEIGHT];
+alignas(4) uint16_t displayBandBuffer[DISPLAY_WIDTH * DISPLAY_BAND_ROWS];
 
 int16_t audioRing[AUDIO_RING_SAMPLES];
 int audioRead = 0;
@@ -63,7 +80,8 @@ int16_t audioChunks[AUDIO_CHUNK_SLOTS][AUDIO_CHUNK_SAMPLES];
 int audioChunkIndex = 0;
 float dcPreviousInput = 0;
 float dcPreviousOutput = 0;
-float playbackRateEwma = AUDIO_SAMPLE_RATE;
+float resampleSourceRateEwma = AUDIO_SAMPLE_RATE;
+uint32_t audioResamplePhase = 0;
 
 uint32_t observedRamGeneration = 0;
 uint32_t savedRamGeneration = 0;
@@ -106,7 +124,7 @@ const char* baseName(const char* path) {
 
 void joinDisplayDma() {
     if (!displayDmaOutstanding) return;
-    M5.Display.waitDMA();
+    M5.Display.endWrite();
     displayDmaOutstanding = false;
 }
 
@@ -350,6 +368,8 @@ int touchedMenuRow() {
 void resetAudio() {
     M5.Speaker.stop(SPEAKER_CHANNEL);
     audioRead = audioWrite = 0;
+    audioResamplePhase = 0;
+    resampleSourceRateEwma = AUDIO_SAMPLE_RATE;
     dcPreviousInput = dcPreviousOutput = 0;
     for (int i = 0; i < 2; i++) {
         memset(audioChunks[audioChunkIndex], 0, sizeof(audioChunks[0]));
@@ -361,8 +381,11 @@ void resetAudio() {
 
 void startGame() {
     appMode = AppMode::Game;
+    gameStartedMs = millis();
     M5.Display.fillScreen(TFT_DARKGREY);
     M5.Display.drawRect(DISPLAY_X - 1, DISPLAY_Y - 1, DISPLAY_WIDTH + 2, DISPLAY_HEIGHT + 2, TFT_CYAN);
+    displayBandIndex = 0;
+    displayDmaOutstanding = false;
     resetAudio();
 }
 
@@ -425,6 +448,12 @@ void applyInput() {
     uint8_t buttons = groveInputBits();
     if (M5.BtnA.isPressed()) buttons |= gb::BTN_SELECT;
     if (M5.BtnB.isPressed()) buttons |= gb::BTN_START;
+#ifdef GB_AUTOPLAY_DEMO
+    const uint32_t gameAgeMs = millis() - gameStartedMs;
+    const bool shouldHoldChord = gameAgeMs >= 1500;
+    if (shouldHoldChord) buttons |= gb::BTN_RIGHT | gb::BTN_A;
+#endif
+    audioDiagnostic.input = buttons;
     const uint8_t newlyPressed = buttons & ~systemGb.buttons;
     if (newlyPressed) systemGb.requestInterrupt(gb::INT_JOYPAD);
     systemGb.buttons = buttons;
@@ -435,7 +464,7 @@ void scaleDisplayBand(uint16_t* destination, int band) {
     for (int bandY = 0; bandY < DISPLAY_BAND_ROWS; bandY++) {
         const int outputY = firstOutputY + bandY;
         const int sourceY = outputY * 2 / 3;
-        const uint16_t* source = systemGb.ppu.framebuffer + sourceY * GB_WIDTH;
+        const uint16_t* source = displaySnapshot + sourceY * GB_WIDTH;
         uint16_t* output = destination + bandY * DISPLAY_WIDTH;
         for (int pair = 0; pair < GB_WIDTH / 2; pair++) {
             const uint16_t left = source[pair * 2];
@@ -447,26 +476,30 @@ void scaleDisplayBand(uint16_t* destination, int band) {
     }
 }
 
-void pushDisplayFrame() {
+void pushDisplayBand() {
+    const bool startsPicture = displayBandIndex == 0;
     const bool displayFrame = systemGb.ppu.frameCount % DISPLAY_FRAME_DIVIDER == 0;
-    if (!displayFrame) return;
+    if (startsPicture && !displayFrame) return;
 
-    for (int band = 0; band < DISPLAY_BANDS; band++) {
-        uint16_t* buffer = displayBandBuffers[band & 1];
-        // The next band is scaled while SPI DMA still owns the other buffer.
-        // Waiting here keeps each buffer alive until its transfer completes.
-        scaleDisplayBand(buffer, band);
-        joinDisplayDma();
-        M5.Display.pushImageDMA(DISPLAY_X, DISPLAY_Y + band * DISPLAY_BAND_ROWS, DISPLAY_WIDTH, DISPLAY_BAND_ROWS,
-                                buffer);
-        displayDmaOutstanding = true;
-    }
+    // One whole emulation frame separates DMA kicks, so this join should be
+    // free in steady state instead of blocking audio for the remaining wire time.
+    joinDisplayDma();
+    if (startsPicture) memcpy(displaySnapshot, systemGb.ppu.framebuffer, sizeof(displaySnapshot));
+    scaleDisplayBand(displayBandBuffer, displayBandIndex);
+    // Keep one outer transaction open so pushImageDMA's nested endWrite only
+    // arms the transfer; joinDisplayDma closes it on the following frame.
+    M5.Display.startWrite();
+    M5.Display.pushImageDMA(DISPLAY_X, DISPLAY_Y + displayBandIndex * DISPLAY_BAND_ROWS, DISPLAY_WIDTH,
+                            DISPLAY_BAND_ROWS, displayBandBuffer);
+    displayDmaOutstanding = true;
+    displayBandIndex = (displayBandIndex + 1) % DISPLAY_BANDS;
 }
 
 int audioAvailable() { return (audioWrite - audioRead) & AUDIO_RING_MASK; }
 
 int enqueueAudio() {
     const int produced = systemGb.apu.sampleCount;
+    int peak = 0;
     float previousInput = dcPreviousInput;
     float previousOutput = dcPreviousOutput;
     int write = audioWrite;
@@ -479,11 +512,15 @@ int enqueueAudio() {
         float sample = filtered * 0.9f;
         if (sample > 1.0f) sample = 1.0f;
         if (sample < -1.0f) sample = -1.0f;
-        audioRing[write] = (int16_t)(sample * 32767.0f);
+        const int16_t output = (int16_t)(sample * 32767.0f);
+        const int magnitude = output < 0 ? -output : output;
+        if (magnitude > peak) peak = magnitude;
+        audioRing[write] = output;
         write = (write + 1) & AUDIO_RING_MASK;
         const bool ringFull = write == read;
         if (ringFull) {
             read = (read + 1) & AUDIO_RING_MASK;
+            audioResamplePhase = 0;
             audioDropped++;
         }
     }
@@ -492,39 +529,70 @@ int enqueueAudio() {
     audioWrite = write;
     audioRead = read;
     systemGb.apu.sampleCount = 0;
+    audioDiagnostic.produced = produced;
+    if ((uint32_t)peak > audioDiagnostic.peak) audioDiagnostic.peak = peak;
+    audioDiagnostic.ringSamples = audioAvailable();
     return produced;
 }
 
-void drainAudio(uint32_t playbackRate) {
-    while (audioAvailable() >= AUDIO_CHUNK_SAMPLES) {
+void drainAudio(uint32_t sourceRate) {
+    const uint32_t sourceStep = ((uint64_t)sourceRate * AUDIO_RESAMPLE_ONE + AUDIO_SAMPLE_RATE / 2) / AUDIO_SAMPLE_RATE;
+    while (true) {
+        const uint64_t lastOutputPhase = audioResamplePhase + (uint64_t)sourceStep * (AUDIO_CHUNK_SAMPLES - 1);
+        const int requiredSourceSamples = (int)(lastOutputPhase / AUDIO_RESAMPLE_ONE) + 2;
+        if (audioAvailable() < requiredSourceSamples) return;
         const bool speakerQueueFull = M5.Speaker.isPlaying(SPEAKER_CHANNEL) >= 2;
         if (speakerQueueFull) return;
+
         int16_t* chunk = audioChunks[audioChunkIndex];
-        const int firstLength = std::min(AUDIO_CHUNK_SAMPLES, AUDIO_RING_SAMPLES - audioRead);
-        memcpy(chunk, audioRing + audioRead, firstLength * sizeof(int16_t));
-        const int secondLength = AUDIO_CHUNK_SAMPLES - firstLength;
-        if (secondLength > 0) memcpy(chunk + firstLength, audioRing, secondLength * sizeof(int16_t));
-        audioRead = (audioRead + AUDIO_CHUNK_SAMPLES) & AUDIO_RING_MASK;
-        const bool queued = M5.Speaker.playRaw(chunk, AUDIO_CHUNK_SAMPLES, playbackRate, false, 1, SPEAKER_CHANNEL);
-        if (!queued) {
-            audioRead = (audioRead - AUDIO_CHUNK_SAMPLES) & AUDIO_RING_MASK;
-            return;
+        uint64_t phase = audioResamplePhase;
+        for (int i = 0; i < AUDIO_CHUNK_SAMPLES; i++) {
+            const int sourceOffset = (int)(phase / AUDIO_RESAMPLE_ONE);
+            const uint32_t fraction = (uint32_t)phase & (AUDIO_RESAMPLE_ONE - 1);
+            const int first = audioRing[(audioRead + sourceOffset) & AUDIO_RING_MASK];
+            const int second = audioRing[(audioRead + sourceOffset + 1) & AUDIO_RING_MASK];
+            chunk[i] = (int16_t)(first + (((int64_t)(second - first) * fraction) >> 16));
+            phase += sourceStep;
         }
+
+        const bool queued =
+            M5.Speaker.playRaw(chunk, AUDIO_CHUNK_SAMPLES, AUDIO_SAMPLE_RATE, false, 1, SPEAKER_CHANNEL);
+        if (!queued) return;
+        audioRead = (audioRead + phase / AUDIO_RESAMPLE_ONE) & AUDIO_RING_MASK;
+        audioResamplePhase = (uint32_t)phase & (AUDIO_RESAMPLE_ONE - 1);
+        audioDiagnostic.chunksQueued++;
         audioChunkIndex = (audioChunkIndex + 1) % AUDIO_CHUNK_SLOTS;
     }
 }
 
-uint32_t updatePlaybackRate(int produced, int64_t wallFrameUs) {
-    if (wallFrameUs > 0) {
-        const float observed = produced * 1000000.0f / (float)wallFrameUs;
-        playbackRateEwma += 0.03f * (observed - playbackRateEwma);
+uint32_t updateResampleSourceRate(uint32_t current, int produced, int64_t wallFrameUs) {
+    static float averageProduced = AUDIO_SAMPLE_RATE * GB_FRAME_US / 1000000.0f;
+    static float averageFrameUs = GB_FRAME_US;
+    static int warmupFrames = AUDIO_RATE_WARMUP_FRAMES;
+
+    const bool observationUsable = wallFrameUs > 0 && produced > 0;
+    if (observationUsable) {
+        averageProduced += AUDIO_RATE_EWMA_ALPHA * ((float)produced - averageProduced);
+        averageFrameUs += AUDIO_RATE_EWMA_ALPHA * ((float)wallFrameUs - averageFrameUs);
     }
-    float rate = playbackRateEwma;
-    const int ringError = audioAvailable() - 2048;
-    rate += ringError * 0.02f;
-    if (rate > AUDIO_SAMPLE_RATE) rate = AUDIO_SAMPLE_RATE;
-    if (rate < 8000) rate = 8000;
-    return (uint32_t)(rate + 0.5f);
+    const float measuredRate = averageProduced * 1000000.0f / averageFrameUs;
+    float correction = (audioAvailable() - AUDIO_RING_TARGET) * AUDIO_RATE_FEEDBACK_GAIN;
+    const float correctionLimit = measuredRate * AUDIO_RATE_FEEDBACK_MAX;
+    if (correction > correctionLimit) correction = correctionLimit;
+    if (correction < -correctionLimit) correction = -correctionLimit;
+    float target = measuredRate + correction;
+
+    if (target > AUDIO_RATE_MAX) target = AUDIO_RATE_MAX;
+    if (target < AUDIO_RATE_MIN) target = AUDIO_RATE_MIN;
+
+    if (warmupFrames > 0) {
+        warmupFrames--;
+        return (uint32_t)(target + 0.5f);
+    }
+    const float slew = current * AUDIO_RATE_SLEW_MAX;
+    if (target < current - slew) target = current - slew;
+    if (target > current + slew) target = current + slew;
+    return (uint32_t)(target + 0.5f);
 }
 
 void maybeSaveSram() {
@@ -545,41 +613,61 @@ void gameLoop() {
     static uint32_t perfStartedMs = millis();
     static uint32_t perfFrames = 0;
     static uint64_t perfFrameUs = 0;
+    static uint64_t perfInputUs = 0;
+    static uint64_t perfAudioUs = 0;
+    static uint64_t perfDisplayUs = 0;
+    static uint64_t perfSaveUs = 0;
 #ifdef GB_PROFILE
-    static uint64_t perfCpuUs = 0;
-    static uint64_t perfPpuUs = 0;
-    static uint64_t perfApuUs = 0;
+    static uint64_t perfCpuCycles = 0;
+    static uint64_t perfPpuCycles = 0;
+    static uint64_t perfApuCycles = 0;
 #endif
 
     const int64_t frameStartUs = esp_timer_get_time();
     const int64_t wallFrameUs = frameStartUs - previousStartUs;
     previousStartUs = frameStartUs;
 
-    joinDisplayDma();
-    M5.update();
+    const bool shouldPollM5 = systemGb.ppu.frameCount % M5_UPDATE_FRAME_DIVIDER == 0;
+    if (shouldPollM5) M5.update();
     logGroveInputState();
     if (M5.BtnC.wasHold()) {
         enterMenu();
         return;
     }
     applyInput();
+    const int64_t inputEndUs = esp_timer_get_time();
 
-    const int64_t emulationStartUs = esp_timer_get_time();
+    const uint32_t nextFrame = systemGb.ppu.frameCount + 1;
+    systemGb.ppu.renderThisFrame = nextFrame % DISPLAY_FRAME_DIVIDER == 0;
+    const int64_t emulationStartUs = inputEndUs;
     systemGb.runFrame();
-    const int64_t emulationUs = esp_timer_get_time() - emulationStartUs;
+    const int64_t emulationEndUs = esp_timer_get_time();
+    const int64_t emulationUs = emulationEndUs - emulationStartUs;
     const int produced = enqueueAudio();
-    const uint32_t playbackRate = updatePlaybackRate(produced, wallFrameUs);
-    drainAudio(playbackRate);
+    const uint32_t sourceRate = updateResampleSourceRate((uint32_t)resampleSourceRateEwma, produced, wallFrameUs);
+    resampleSourceRateEwma = sourceRate;
+    drainAudio(sourceRate);
+    audioDiagnostic.ringSamples = audioAvailable();
+    audioDiagnostic.speakerQueue = M5.Speaker.isPlaying(SPEAKER_CHANNEL);
+    audioDiagnostic.speakerRunning = M5.Speaker.isRunning();
+    const int64_t audioEndUs = esp_timer_get_time();
 
-    pushDisplayFrame();
+    pushDisplayBand();
+    const int64_t displayEndUs = esp_timer_get_time();
+    drainAudio(sourceRate);
     maybeSaveSram();
+    const int64_t workEndUs = esp_timer_get_time();
 
     perfFrames++;
     perfFrameUs += emulationUs;
+    perfInputUs += inputEndUs - frameStartUs;
+    perfAudioUs += audioEndUs - emulationEndUs;
+    perfDisplayUs += displayEndUs - audioEndUs;
+    perfSaveUs += workEndUs - displayEndUs;
 #ifdef GB_PROFILE
-    perfCpuUs += systemGb.profileCpuUs;
-    perfPpuUs += systemGb.profilePpuUs;
-    perfApuUs += systemGb.profileApuUs;
+    perfCpuCycles += systemGb.profileCpuCycles;
+    perfPpuCycles += systemGb.profilePpuCycles;
+    perfApuCycles += systemGb.profileApuCycles;
 #endif
     const uint32_t nowMs = millis();
     if (nowMs - perfStartedMs >= PERF_LOG_INTERVAL_MS) {
@@ -590,20 +678,29 @@ void gameLoop() {
         if (ringSamples == 0) audioUnderruns++;
         Serial.printf("{\"component\":\"runtime\",\"event\":\"perf\",\"frame\":%u,\"fps\":%.2f,"
                       "\"frame_us\":%u,\"audio_ring_samples\":%d,\"audio_underruns\":%u,"
-                      "\"audio_dropped\":%u,\"playback_rate_hz\":%u,\"heap_free_bytes\":%u,"
-                      "\"psram_free_bytes\":%u,\"display_mode\":\"scaled-3:2-dma-30fps\"}\n",
-                      systemGb.ppu.frameCount, fps, averageUs, ringSamples, audioUnderruns, audioDropped, playbackRate,
-                      ESP.getFreeHeap(), ESP.getFreePsram());
+                      "\"audio_dropped\":%u,\"playback_rate_hz\":%u,\"resample_source_rate_hz\":%u,"
+                      "\"heap_free_bytes\":%u,"
+                      "\"psram_free_bytes\":%u,\"display_mode\":\"scaled-3:2-banded-dma-15fps\"}\n",
+                      systemGb.ppu.frameCount, fps, averageUs, ringSamples, audioUnderruns, audioDropped,
+                      AUDIO_SAMPLE_RATE, sourceRate, ESP.getFreeHeap(), ESP.getFreePsram());
+        Serial.printf("{\"component\":\"runtime\",\"event\":\"frontend_profile\",\"frame\":%u,"
+                      "\"input_us\":%u,\"audio_us\":%u,\"display_us\":%u,\"save_us\":%u}\n",
+                      systemGb.ppu.frameCount, (unsigned)(perfInputUs / perfFrames),
+                      (unsigned)(perfAudioUs / perfFrames), (unsigned)(perfDisplayUs / perfFrames),
+                      (unsigned)(perfSaveUs / perfFrames));
 #ifdef GB_PROFILE
+        constexpr uint32_t CPU_CYCLES_PER_US = 240;
         Serial.printf("{\"component\":\"runtime\",\"event\":\"profile\",\"frame\":%u,"
                       "\"cpu_us\":%u,\"ppu_us\":%u,\"apu_us\":%u}\n",
-                      systemGb.ppu.frameCount, (unsigned)(perfCpuUs / perfFrames), (unsigned)(perfPpuUs / perfFrames),
-                      (unsigned)(perfApuUs / perfFrames));
-        perfCpuUs = perfPpuUs = perfApuUs = 0;
+                      systemGb.ppu.frameCount, (unsigned)(perfCpuCycles / perfFrames / CPU_CYCLES_PER_US),
+                      (unsigned)(perfPpuCycles / perfFrames / CPU_CYCLES_PER_US),
+                      (unsigned)(perfApuCycles / perfFrames / CPU_CYCLES_PER_US));
+        perfCpuCycles = perfPpuCycles = perfApuCycles = 0;
 #endif
         perfStartedMs = nowMs;
         perfFrames = 0;
         perfFrameUs = 0;
+        perfInputUs = perfAudioUs = perfDisplayUs = perfSaveUs = 0;
     }
 
     nextFrameUs += GB_FRAME_US;
@@ -657,6 +754,7 @@ void setup() {
     speakerConfig.task_priority = 4;
     M5.Speaker.config(speakerConfig);
     const bool speakerStarted = M5.Speaker.begin();
+    audioDiagnostic.speakerRunning = M5.Speaker.isRunning();
     M5.Speaker.setVolume(SPEAKER_VOLUME);
     Serial.printf("{\"component\":\"audio\",\"event\":\"speaker_begin\",\"ok\":%s}\n",
                   speakerStarted ? "true" : "false");

@@ -27,13 +27,17 @@ void PPU::reset(bool cgbMode) {
     lcdc = 0x91; stat = 0x85; scy = scx = 0; ly = 0; lyc = 0;
     bgp = 0xFC; obp0 = obp1 = 0xFF; wy = wx = 0;
     bcps = ocps = 0;
-    dot = 0; windowLine = 0; frameDone = false; statLine = false;
+    dot = 0; windowLine = 0; frameDone = false; renderThisFrame = true; statLine = false;
     // CGB boot leaves palette RAM white-ish; fill with white so DMG-only ROMs
     // that never touch BCPD still show something
     memset(bgPal, 0xFF, sizeof(bgPal));
     memset(objPal, 0xFF, sizeof(objPal));
     memset(framebuffer, 0xFF, sizeof(framebuffer));
     for (int i = 0; i < 4; i++) dmgShades[i] = toPixel(DMG_SHADES_RGBA[i]);
+    for (int i = 0; i < 32; i++) {
+        updateCgbColor(false, i * 2);
+        updateCgbColor(true, i * 2);
+    }
 }
 
 Pixel PPU::cgbColor(const uint8_t* pal, int palIdx, int colorIdx) const {
@@ -46,6 +50,13 @@ Pixel PPU::cgbColor(const uint8_t* pal, int palIdx, int colorIdx) const {
     int B = (r * 6 + gr * 4 + bl * 22) / 32;
     R = R * 255 / 31; G = G * 255 / 31; B = B * 255 / 31;
     return toPixel(0xFF000000 | (B << 16) | (G << 8) | R);
+}
+
+void PPU::updateCgbColor(bool objectPalette, int byteIndex) {
+    const int colorIndex = (byteIndex & 0x3F) >> 1;
+    const uint8_t* palette = objectPalette ? objPal : bgPal;
+    Pixel* cache = objectPalette ? objColorCache : bgColorCache;
+    cache[colorIndex] = cgbColor(palette, colorIndex >> 2, colorIndex & 3);
 }
 
 void PPU::checkStatIrq() {
@@ -74,8 +85,12 @@ void PPU::tick(int dots) {
         else if (dot < 81) nextEvent = 81;
         else if (dot < 253) nextEvent = 253;
         else nextEvent = 456;
-        int advance = nextEvent - dot;
-        if (advance > dots) advance = dots;
+        const int advance = nextEvent - dot;
+        const bool staysBeforeEvent = dots < advance;
+        if (staysBeforeEvent) {
+            dot += dots;
+            return;
+        }
         dot += advance;
         dots -= advance;
 #else
@@ -92,7 +107,13 @@ void PPU::tick(int dots) {
         if (mode != oldMode) {
             stat = (stat & ~3) | mode;
             if (mode == 0) { // entering hblank
-                renderScanline();
+                if (renderThisFrame) {
+                    renderScanline();
+                } else {
+                    const bool backgroundCanDraw = gb->cgb || (lcdc & 0x01);
+                    const bool windowDrawn = backgroundCanDraw && (lcdc & 0x20) && wx <= 166 && wy <= ly;
+                    if (windowDrawn) windowLine++;
+                }
                 if (gb->hdmaActive) gb->doHdmaBlock();
             }
             if (mode == 1) {
@@ -130,13 +151,15 @@ void PPU::renderScanline() {
 
     // ---- background + window ----
     if (cgbMode || bgEnable) {
-        for (int x = 0; x < 160; x++) {
+        int x = 0;
+        const int windowStart = wx - 7;
+        while (x < 160) {
             int tileX, tileY, px, py;
             uint16_t mapBase;
-            bool inWindow = winEnable && x >= (wx - 7);
+            const bool inWindow = winEnable && x >= windowStart;
             if (inWindow) {
                 mapBase = (lcdc & 0x40) ? 0x1C00 : 0x1800;
-                int wxo = x - (wx - 7);
+                const int wxo = x - windowStart;
                 tileX = wxo >> 3; px = wxo & 7;
                 tileY = windowLine >> 3; py = windowLine & 7;
                 windowDrawn = true;
@@ -150,21 +173,33 @@ void PPU::renderScanline() {
             uint8_t tileNum = g.vram[0][mapAddr];
             uint8_t attr = cgbMode ? g.vram[1][mapAddr] : 0;
             int bank = (attr >> 3) & 1;
-            if (attr & 0x20) px = 7 - px;      // X flip
             if (attr & 0x40) py = 7 - py;      // Y flip
             uint16_t tileAddr;
             if (lcdc & 0x10) tileAddr = tileNum * 16;
             else tileAddr = 0x1000 + ((int8_t)tileNum) * 16;
             uint8_t lo = g.vram[bank][tileAddr + py * 2];
             uint8_t hi = g.vram[bank][tileAddr + py * 2 + 1];
-            int ci = ((lo >> (7 - px)) & 1) | (((hi >> (7 - px)) & 1) << 1);
-            bgColorIdx[x] = ci;
-            bgPriority[x] = (attr >> 7) & 1;
-            if (cgbMode) {
-                row[x] = cgbColor(bgPal, attr & 7, ci);
-            } else {
-                row[x] = dmgShades[(bgp >> (ci * 2)) & 3];
+
+            int runLength = 8 - px;
+            const int pixelsRemaining = 160 - x;
+            if (runLength > pixelsRemaining) runLength = pixelsRemaining;
+            const bool windowBeginsInRun = !inWindow && winEnable && windowStart > x && windowStart < x + runLength;
+            if (windowBeginsInRun) runLength = windowStart - x;
+
+            for (int i = 0; i < runLength; i++) {
+                const int tilePixel = (attr & 0x20) ? 7 - (px + i) : px + i;
+                const int bit = 7 - tilePixel;
+                const int ci = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+                const int outputX = x + i;
+                bgColorIdx[outputX] = ci;
+                bgPriority[outputX] = (attr >> 7) & 1;
+                if (cgbMode) {
+                    row[outputX] = bgColorCache[(attr & 7) * 4 + ci];
+                } else {
+                    row[outputX] = dmgShades[(bgp >> (ci * 2)) & 3];
+                }
             }
+            x += runLength;
         }
     } else {
         for (int x = 0; x < 160; x++) row[x] = dmgShades[0];
@@ -217,7 +252,7 @@ void PPU::renderScanline() {
                 if ((attr & 0x80) || (cgbMode && bgPriority[sxp])) continue;
             }
             if (cgbMode) {
-                row[sxp] = cgbColor(objPal, attr & 7, ci);
+                row[sxp] = objColorCache[(attr & 7) * 4 + ci];
             } else {
                 uint8_t pal = (attr & 0x10) ? obp1 : obp0;
                 row[sxp] = dmgShades[(pal >> (ci * 2)) & 3];

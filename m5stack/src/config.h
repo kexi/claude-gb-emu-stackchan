@@ -11,7 +11,7 @@ constexpr int DISPLAY_X = 40;
 constexpr int DISPLAY_Y = 12;
 constexpr int DISPLAY_BAND_ROWS = 54;
 constexpr int DISPLAY_BANDS = DISPLAY_HEIGHT / DISPLAY_BAND_ROWS;
-constexpr int DISPLAY_FRAME_DIVIDER = 2;
+constexpr int DISPLAY_FRAME_DIVIDER = DISPLAY_BANDS;
 constexpr uint32_t DISPLAY_SPI_HZ = 40000000;
 static_assert(DISPLAY_WIDTH * 2 == GB_WIDTH * 3, "horizontal scale must be exactly 3:2");
 static_assert(DISPLAY_HEIGHT * 2 == GB_HEIGHT * 3, "vertical scale must be exactly 3:2");
@@ -25,6 +25,15 @@ constexpr int AUDIO_RING_SAMPLES = 8192;
 constexpr int AUDIO_RING_MASK = AUDIO_RING_SAMPLES - 1;
 constexpr int AUDIO_CHUNK_SAMPLES = 512;
 constexpr int AUDIO_CHUNK_SLOTS = 4;
+constexpr int AUDIO_RING_TARGET = AUDIO_RING_SAMPLES / 2;
+constexpr float AUDIO_RATE_EWMA_ALPHA = 0.03f;
+constexpr int AUDIO_RATE_WARMUP_FRAMES = 120;
+constexpr float AUDIO_RATE_FEEDBACK_GAIN = 0.1f;
+constexpr float AUDIO_RATE_FEEDBACK_MAX = 0.02f;
+constexpr float AUDIO_RATE_SLEW_MAX = 0.0025f;
+constexpr uint32_t AUDIO_RATE_MIN = 4000;
+constexpr uint32_t AUDIO_RATE_MAX = 48000;
+constexpr uint32_t AUDIO_RESAMPLE_ONE = 1U << 16;
 static_assert((AUDIO_RING_SAMPLES & AUDIO_RING_MASK) == 0, "audio ring size must be a power of two");
 
 constexpr char SD_ROMS_DIR[] = "/roms";
@@ -55,3 +64,4 @@ constexpr int DUAL_BTN_PIN_RED = 17;
 
 constexpr int64_t GB_FRAME_US = 16743;   // 70224 / 4194304 seconds
 constexpr uint32_t PERF_LOG_INTERVAL_MS = 1000;
+constexpr uint32_t M5_UPDATE_FRAME_DIVIDER = 2;
