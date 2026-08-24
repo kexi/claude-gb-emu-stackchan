@@ -51,7 +51,7 @@ fmt-check:
 # Web / 組込みコアを構文検査する
 lint:
     clang++ -std=c++17 -fsyntax-only core/*.cpp core/ymfm/ymfm_opm.cpp
-    clang++ -std=c++17 -DGB_EMBEDDED -fsyntax-only core/*.cpp
+    clang++ -std=c++17 -DGB_EMBEDDED -fsyntax-only core/*.cpp core/ymfm/ymfm_opm.cpp
 
 # 実コンパイル設定から database を生成し、共有組込みコアを clang-tidy で検査する
 clang-tidy:
@@ -67,7 +67,7 @@ test frames='180':
     work_dir=$(mktemp -d)
     trap 'rm -rf "$work_dir"' EXIT
     clang++ -std=c++17 -O2 -o "$work_dir/ref" tools/verify_host.cpp core/*.cpp core/ymfm/ymfm_opm.cpp
-    clang++ -std=c++17 -O2 -DGB_EMBEDDED -o "$work_dir/embedded" tools/verify_host.cpp core/*.cpp
+    clang++ -std=c++17 -O2 -DGB_EMBEDDED -o "$work_dir/embedded" tools/verify_host.cpp core/*.cpp core/ymfm/ymfm_opm.cpp
     "$work_dir/ref" "{{ frames }}" > "$work_dir/ref.txt"
     "$work_dir/embedded" "{{ frames }}" > "$work_dir/embedded.txt"
     diff -u "$work_dir/ref.txt" "$work_dir/embedded.txt"
@@ -86,9 +86,22 @@ test-rom frames='180': rom
     work_dir=$(mktemp -d)
     trap 'rm -rf "$work_dir"' EXIT
     clang++ -std=c++17 -O2 -o "$work_dir/ref" tools/verify_host.cpp core/*.cpp core/ymfm/ymfm_opm.cpp
-    clang++ -std=c++17 -O2 -DGB_EMBEDDED -o "$work_dir/embedded" tools/verify_host.cpp core/*.cpp
+    clang++ -std=c++17 -O2 -DGB_EMBEDDED -o "$work_dir/embedded" tools/verify_host.cpp core/*.cpp core/ymfm/ymfm_opm.cpp
     "$work_dir/ref" "{{ frames }}" m5stack/data/kantan-gb-play.gbc > "$work_dir/ref.txt"
     "$work_dir/embedded" "{{ frames }}" m5stack/data/kantan-gb-play.gbc > "$work_dir/embedded.txt"
+    diff -u "$work_dir/ref.txt" "$work_dir/embedded.txt"
+    cat "$work_dir/ref.txt"
+
+# KANTAN GBのYM2151経路を参照版とCoreS3版で決定的に比較する
+test-rom-fm frames='180': rom
+    #!/bin/bash
+    set -euo pipefail
+    work_dir=$(mktemp -d)
+    trap 'rm -rf "$work_dir"' EXIT
+    clang++ -std=c++17 -O2 -o "$work_dir/ref" tools/verify_host.cpp core/*.cpp core/ymfm/ymfm_opm.cpp
+    clang++ -std=c++17 -O2 -DGB_EMBEDDED -o "$work_dir/embedded" tools/verify_host.cpp core/*.cpp core/ymfm/ymfm_opm.cpp
+    "$work_dir/ref" "{{ frames }}" m5stack/data/kantan-gb-play.gbc --fm > "$work_dir/ref.txt"
+    "$work_dir/embedded" "{{ frames }}" m5stack/data/kantan-gb-play.gbc --fm > "$work_dir/embedded.txt"
     diff -u "$work_dir/ref.txt" "$work_dir/embedded.txt"
     cat "$work_dir/ref.txt"
 
@@ -111,6 +124,10 @@ build-profile: rom
 # KANTAN GB PLAY の内蔵デモを自動開始する診断版をビルドする
 build-autoplay: rom
     cd m5stack && pio run -e m5stack-cores3-autoplay
+
+# KANTAN GB PLAY のFM内蔵デモを計測付きで自動開始する診断版をビルドする
+build-profile-autoplay: rom
+    cd m5stack && pio run -e m5stack-cores3-profile-autoplay
 
 # M5Stack CoreS3 へ通常版を書き込む（既存 firmware を置換するため yes 必須）
 flash port confirm='':
@@ -147,6 +164,18 @@ flash-autoplay port confirm='':
     bash ./m5stack/scripts/fetch-rom.sh
     cd m5stack
     pio run -e m5stack-cores3-autoplay -t upload --upload-port "{{ port }}"
+
+# KANTAN GB PLAY のFM内蔵デモを計測付きで自動開始して書き込む（既存 firmware を置換するため yes 必須）
+flash-profile-autoplay port confirm='':
+    #!/bin/bash
+    set -euo pipefail
+    if [[ "{{ confirm }}" != "yes" ]]; then
+        echo "書き込むには just flash-profile-autoplay <port> yes を指定してください" >&2
+        exit 2
+    fi
+    bash ./m5stack/scripts/fetch-rom.sh
+    cd m5stack
+    pio run -e m5stack-cores3-profile-autoplay -t upload --upload-port "{{ port }}"
 
 # M5Stack CoreS3 のシリアルログを表示する
 monitor port='':

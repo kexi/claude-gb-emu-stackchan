@@ -2,7 +2,7 @@
   "name": "gb-core",
   "version": "1.0.0",
   "build": {
-    "srcFilter": ["+<*.cpp>"],
+    "srcFilter": ["+<*.cpp>", "+<ymfm/ymfm_opm.cpp>"],
     "flags": ["-O3"]
   }
 }

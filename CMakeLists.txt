@@ -15,6 +15,7 @@ add_library(
   core/cpu.cpp
   core/gb.cpp
   core/ppu.cpp
+  core/ymfm/ymfm_opm.cpp
 )
 target_compile_definitions(gb_embedded_core PUBLIC GB_EMBEDDED)
 target_include_directories(gb_embedded_core PUBLIC core)

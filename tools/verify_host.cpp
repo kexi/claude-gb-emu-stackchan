@@ -70,6 +70,31 @@ size_t countDistinctPixels(const gb::Pixel* pixels, size_t count) {
     return distinct.size();
 }
 
+bool verifyChromaticV4() {
+    gb::ChromaticFM fm;
+    fm.enabled = true;
+    fm.reset();
+    const bool identityMatches = fm.read(6) == 0x51 && fm.read(7) == 0x04;
+    if (!identityMatches) return false;
+
+    for (int byte = 0; byte < 256; byte++) fm.write(2, static_cast<uint8_t>(byte));
+    const bool fullFifoBlocksWrites = (fm.read(2) & 0x40) == 0 && fm.fifoCount == 256;
+    fm.write(2, 0xAA);
+    if (!fullFifoBlocksWrites || fm.fifoCount != 256) return false;
+
+    fm.write(3, 0x8D);
+    const bool risingEdgeStarts = (fm.read(2) & 0x20) != 0 && fm.fifoCount == 256;
+    fm.write(3, 0x8D);
+    const bool levelWriteDoesNotRestart = fm.fifoCount == 256;
+    fm.write(3, 0x85);
+    const bool fallingEdgeStopsAndClears = (fm.read(2) & 0x20) == 0 && fm.fifoCount == 0;
+    if (!risingEdgeStarts || !levelWriteDoesNotRestart || !fallingEdgeStopsAndClears) return false;
+
+    fm.write(3, 0x8D);
+    for (int sample = 0; sample < 4; sample++) fm.generateSample(44100.0);
+    return (fm.read(2) & 0x20) == 0;
+}
+
 }   // namespace
 
 int runVerification(int argc, char** argv) {
@@ -81,6 +106,11 @@ int runVerification(int argc, char** argv) {
     }
 
     const bool usesExternalRom = argc > 2;
+    const bool enablesFm = argc > 3 && std::strcmp(argv[3], "--fm") == 0;
+    if (enablesFm && !verifyChromaticV4()) {
+        std::fprintf(stderr, "Chromatic v4 register contract failed\n");
+        return 1;
+    }
     const std::vector<uint8_t> rom = usesExternalRom ? loadRomFile(argv[2]) : makeTestRom();
     if (rom.empty()) {
         std::fprintf(stderr, "ROM file could not be read: %s\n", argv[2]);
@@ -88,6 +118,7 @@ int runVerification(int argc, char** argv) {
     }
     auto system = std::make_unique<gb::GB>();
     system->apu.setSampleRate(44100.0);
+    system->fm.enabled = enablesFm;
     if (!system->loadRom(rom.data(), rom.size())) {
         std::fprintf(stderr, "%s ROM was rejected\n", usesExternalRom ? "external" : "synthetic");
         return 1;

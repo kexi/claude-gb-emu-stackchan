@@ -25,6 +25,8 @@ constexpr int AUDIO_RING_SAMPLES = 8192;
 constexpr int AUDIO_RING_MASK = AUDIO_RING_SAMPLES - 1;
 constexpr int AUDIO_CHUNK_SAMPLES = 512;
 constexpr int AUDIO_CHUNK_SLOTS = 4;
+constexpr int AUDIO_MIX_RING_SAMPLES = 2048;
+constexpr int AUDIO_MIX_RING_MASK = AUDIO_MIX_RING_SAMPLES - 1;
 constexpr int AUDIO_RING_TARGET = AUDIO_RING_SAMPLES / 2;
 constexpr float AUDIO_RATE_EWMA_ALPHA = 0.03f;
 constexpr int AUDIO_RATE_WARMUP_FRAMES = 120;
@@ -35,6 +37,7 @@ constexpr uint32_t AUDIO_RATE_MIN = 4000;
 constexpr uint32_t AUDIO_RATE_MAX = 48000;
 constexpr uint32_t AUDIO_RESAMPLE_ONE = 1U << 16;
 static_assert((AUDIO_RING_SAMPLES & AUDIO_RING_MASK) == 0, "audio ring size must be a power of two");
+static_assert((AUDIO_MIX_RING_SAMPLES & AUDIO_MIX_RING_MASK) == 0, "mix ring size must be a power of two");
 
 constexpr char SD_ROMS_DIR[] = "/roms";
 constexpr uint32_t SD_SPI_HZ = 25000000;

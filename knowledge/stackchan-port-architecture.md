@@ -34,6 +34,10 @@ sources:
     resource: https://github.com/GOROman/YM2151-Claude-3.7-Sonnet
     title: C++17 YM2151 FM sound emulator
     author: person:GOROman
+  - id: ymfm
+    resource: ../core/ymfm
+    title: Aaron Giles ymfm YM2151 implementation (BSD-3-Clause)
+    author: person:Aaron-Giles
 ---
 
 # 目的と完了条件
@@ -58,7 +62,7 @@ sources:
 
 ## タスクと所有権
 
-Core 1 の Arduino loop がエミュレーション、音声リングへの投入、LCD DMA の起動、SD 操作を直列に所有する。LCD と microSD は SPI バスを共有するため、SD 操作前に必ず未完了 DMA を join する。Core 0 には Grove I2C / GPIO 入力ポーリングだけを置き、Core 1 は atomic な 1 byte をフレーム境界で読む。[^cores3-docs]
+Core 1 の Arduino loop がエミュレーション、PSG音声リングへの投入、LCD DMA の起動、SD 操作を直列に所有する。LCD と microSD は SPI バスを共有するため、SD 操作前に必ず未完了 DMA を join する。Core 0 にはGrove I2C / GPIO入力、YM2151合成、音声mix/resample、speaker queue投入を置く。Core 1はatomicな入力1 byteをフレーム境界で読み、Core 0とはSPSC PCM ringと時刻付きFM event ringだけを共有する。[^cores3-docs]
 
 ROM 選択メニュー中はエミュレーションと DMA バンド転送を停止し、通常の同期描画と SD 操作へ所有権を切り替える。ゲーム中に別タスクから SD や LCD を触らせない。
 
@@ -105,6 +109,16 @@ GBの目標フレーム周期は70,224 / 4,194,304 = 約16.7427 ms（約59.7275 
 
 CoreS3の内蔵speakerと内蔵micはBCLK/WSとI2S1を共有する。M5Unified 0.2.15は両者を別driverとして排他的に扱い、公式microphone exampleも録音時にspeakerを停止する。このため現行APIだけではspeakerの音響loopbackを内蔵micで同時収録できない。自動click評価を追加する場合は通常firmwareから分離した`audio-lab`環境で、ESP-IDFのI2S TX+RX full-duplex driverへ所有権を一本化して検証する。通常版へ未検証のcodec制御を混ぜない。
 
+## Chromatic YM2151
+
+FM backendは既存のBSD-3-Clause `core/ymfm`だけを用いる。Chromatic status-map v4としてFF28/FF29を全YM registerのaddress/data、FF2A writeを256 byte ADPCM FIFO、FF2B bit3を再生edge、FF2Eを`0x51`、FF2Fを`0x04`として実装する。PSG/FM選択はROM reset境界だけで適用し、FMを既定とする。PSG時はFF2Eが`0xFF`なのでROM自身がGame Boy APU driverを選ぶ。
+
+同期ymfmはCore 1のAPUだけで約12.7 ms/frameを消費し、約31 fpsまで低下した。このためCore 1は44.1 kHz PSG PCMとsample cursor付きFM write eventだけを生成し、Core 0の低優先度workerがymfm、ADPCM、mix、DC blocker、resampler、M5Unified speaker queueを一括所有する。LCDは従来の非同期band DMAを維持する。非同期版はdrop/underrun/backpressureを解消したが、両coreのFlash/I-cache競合により約40 fpsであり、59 fps達成は未完了である。
+
+SM83→Xtensa JITはCPU区間が約5 msで主因でなく、ymfmはopcode interpreterではなくsample間feedbackを持つ整数DSPなので現フェーズでは採用しない。ESP32-S3の実行可能internal RAMとcache同期を使う複雑性に対し、必要な12.7 ms削減へ届かない。ymfm hot pathのIRAM配置はIRAM残量約1.5 KiBで起動しなかったため撤回し、ROM cache lockとinactive-channel clock省略も実測差がなかったため撤回した。
+
+JITは将来候補から除外しないが、実装開始のgateを「FM workerを非同期化した後もSM83 CPUがp95で8 ms/frame以上」かつ「2倍高速化の上限見積も含めて目標59.7 fpsへ届く」とする。その時は先にbasic-block cache、MBC bankを含むcode key、cycle-accurate side exit、interrupt/HALT/CGB double-speed、RAM実行・自己書き換え時のinvalidate、実行可能internal RAM上限をhost testで設計する。ymfmについては動的JITを行わず、profileが示した固定hot pathのAOT特化、fixed-point、Xtensa intrinsicの順で比較する。
+
 # ROM、保存、操作
 
 既定ROMはKANTAN GB PLAYの32 KiB CGB ROMとする。upstreamのコミットSHAとROMのSHA-256を `m5stack/rom.lock` に固定し、ビルド時に取得・検証してPlatformIOの `embed_files` でfirmwareへ埋め込む。upstreamにライセンス宣言がないためROMバイナリはリポジトリへ含めず、生成firmwareの再配布にも権利者の許諾が必要である。[^kantan-gb-play]
@@ -129,7 +143,7 @@ CoreS3の内蔵speakerと内蔵micはBCLK/WSとI2S1を共有する。M5Unified 0
 
 # 非目標
 
-初期移植では Wi-Fi、ブラウザからのミラー、UDP ROM 転送、リモート CLI、Chromatic FM 拡張の実機音声を対象にしない。これらはゲーム実行経路の性能・正確性を確立した後に独立して追加できる。Web 版の Chromatic FM 機能は維持する。
+初期移植では Wi-Fi、ブラウザからのミラー、UDP ROM 転送、リモート CLIを対象にしない。これらはゲーム実行経路の性能・正確性を確立した後に独立して追加できる。Web 版の Chromatic FM 機能は維持する。
 
 # 検証記録
 
@@ -154,6 +168,9 @@ CoreS3の内蔵speakerと内蔵micはBCLK/WSとI2S1を共有する。M5Unified 0
 - `pushImageDMA`単独呼び出しは約5.5 ms待っていた。NES移植例と同じ外側transaction方式へ変更し、翌frameの`endWrite()`までDMAを重ねた結果、LCD区間は約0.33 ms、実機は58.5〜59.3 fpsになった。さらにゲーム中のM5本体button/touch pollを30 Hzへ落とし、Grove pollは125 Hzのまま維持した結果、59.4〜59.9 fps、input区間約0.24 msになった。
 - chunkごとにspeaker playback rateを43 kHz台から44.1 kHzへ変える方式ではringのoverflowとrate揺れが残った。speakerを44.1 kHz固定、16.16位相連続linear resamplerへ変更し、ring中央feedbackを適用した。約7,600 frameまでの実機ログでringは概ね2,900〜3,500 samples、`audio_underruns=0`、`audio_dropped=0`、speaker rate 44,100 Hzを確認した。resampler追加後のaudio frontendは約0.37 ms、静的RAM 251,148 B（76.6%）、Flash 634,313 B（9.7%）。主観的なclick消失は利用者の最終聴取待ちなので文書statusは`draft`のままとする。
 - 内蔵micによる自己録音を調査した。CoreS3はspeaker data GPIO13、mic data GPIO14で、BCLK GPIO34、WS GPIO33、I2S1を共有する。M5Unified 0.2.15のAPIと公式exampleは両者を排他利用するため、同時loopbackにはM5Unifiedの上で単に`Mic.begin()`を加えるのではなく、別診断環境でI2S TX+RX full-duplex所有者を実装する必要があると確認した。
+- Chromatic v4へ更新し、KANTAN GB PLAYのFM経路を通常版と`GB_EMBEDDED`版で180 frame比較した。CPU・memory・framebuffer・audio CRCは一致し、`fb=2f1926c0`、`audio=446ea41d`だった。CoreS3計測版は静的RAM 259,436 B（79.2%）、Flash 653,117 B（10.0%）。
+- 同期ymfm実機版は約31 fps、frame約30.4 ms、APU約12.7 ms、audio drop増加だった。Core 0非同期worker版は約40 fps、frame約24.0 msへ改善し、30秒ログで`audio_underruns=0`、`audio_dropped=0`、PCM/event backpressureとも0を確認した。一方、目標59 fpsには未達である。
+- ymfm `generate`のIRAM配置は`.iram0.text`が64,771 Bとなり、起動ログが出ない状態になったため即時撤回した。I-cache lockとinactive channel clock省略は起動したが約40 fpsから有意に改善せず、ROM API依存と互換性リスクを残すため撤回した。これらは失敗した最適化として再採用しない。
 
 [^local-gb-core]: 現行 `core/` の 2026-08-24 時点のソース調査。
 [^nes-stackchan-port]: NES 移植例の `core/`、`m5stack/`、ホスト比較 harness、性能関連コミットの調査。
